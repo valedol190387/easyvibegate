@@ -1,0 +1,44 @@
+{
+  "name": "vibegate",
+  "version": "0.2.0",
+  "description": "Universal, interactive security scanner for vibe-coded apps. Proves the hole fires, not just guesses it.",
+  "type": "module",
+  "bin": {
+    "vibegate": "dist/cli/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build",
+    "vibegate": "node dist/cli/index.js"
+  },
+  "author": "valedol190387 (https://github.com/valedol190387)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/valedol190387/easyvibegate.git"
+  },
+  "homepage": "https://github.com/valedol190387/easyvibegate#readme",
+  "bugs": {
+    "url": "https://github.com/valedol190387/easyvibegate/issues"
+  },
+  "keywords": [
+    "security",
+    "vibe-coding",
+    "scanner",
+    "supabase",
+    "rls",
+    "secrets",
+    "audit"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "typescript": "^5.6.3"
+  }
+}

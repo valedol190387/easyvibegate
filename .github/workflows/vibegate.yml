@@ -1,0 +1,31 @@
+name: VibeGate security check
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- For the VibeGate repo itself: build from source and scan itself. ---
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: node dist/cli/index.js . --ci
+
+      # --- In YOUR project, replace everything above with just: ---
+      #   - uses: actions/checkout@v4
+      #   - uses: actions/setup-node@v4
+      #     with: { node-version: 20 }
+      #   - run: npx vibegate . --ci
+      # (exit code: 2 = critical found, 1 = warnings, 0 = clean)
