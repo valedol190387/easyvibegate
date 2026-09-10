@@ -136,7 +136,7 @@ export const secretsChecker: Checker = {
           severity: 'warning',
           title: 'Possible hardcoded secret',
           detail: `A high-entropy value is assigned to a secret-looking name: ${redact(value)}`,
-          fix: 'If this is a real credential, move it to an env var and rotate it. If not, rename the variable or add `// vibegate-ignore`.',
+          fix: 'If this is a real credential, move it to an env var and rotate it. If not, rename the variable or add `// easyvibegate-ignore`.',
           checker: 'secrets',
           level: 0,
           file: rel,

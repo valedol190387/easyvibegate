@@ -33,7 +33,7 @@ export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<
         severity: 'info',
         title: `Checker "${checker.id}" failed`,
         detail: err instanceof Error ? err.message : String(err),
-        fix: 'Please report this at the VibeGate repository.',
+        fix: 'Please report this at the EasyVibeGate repository.',
         checker: checker.id,
         level: checker.level,
       });

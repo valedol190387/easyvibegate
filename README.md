@@ -1,10 +1,10 @@
-# 🛡 VibeGate
+# 🛡 EasyVibeGate
 
 ![license: MIT](https://img.shields.io/badge/license-MIT-brightgreen) ![node](https://img.shields.io/badge/node-%3E%3D18-blue) ![lang](https://img.shields.io/badge/lang-en%20%7C%20ru-informational)
 
 **Universal security scanner for vibe-coded apps. It doesn't just guess a hole exists — it proves the hole fires.**
 
-Most scanners grep your code and say *"you might have leaked a key."* VibeGate is built to go further:
+Most scanners grep your code and say *"you might have leaked a key."* EasyVibeGate is built to go further:
 walk in with the anonymous key, read the data that should have been protected, and hand you back the
 exact `curl` that did it — plus the SQL to close it. Works on any stack.
 
@@ -14,13 +14,13 @@ exact `curl` that did it — plus the SQL to close it. Works on any stack.
 ## Quick start (made for beginners)
 
 ```bash
-npx vibegate
+npx easyvibegate
 ```
 
 Run it inside your project. A friendly wizard asks a few plain yes/no questions, then tells you what's
 wrong in plain language and hands you a ready-to-use fix plan. No install, no config, no runtime deps.
 
-**Then let your AI fix it:** open `vibegate-report/ai-fix-prompt.md` and paste it into your AI coding
+**Then let your AI fix it:** open `easyvibegate-report/ai-fix-prompt.md` and paste it into your AI coding
 assistant (Cursor, Claude Code, Windsurf…). For security fixes, pick a strong model like **Claude Fable**
 or Opus — not a small "fast" one.
 
@@ -31,12 +31,12 @@ so they hand off cleanly to your AI agent.
 Power/CI usage skips the wizard:
 
 ```bash
-vibegate . --no-wizard             # just scan and print results
-vibegate . --deps                  # + dependency vulnerability audit
-vibegate . --url https://myapp.com --i-own-this   # + live probe (own apps only)
-vibegate . --ci                    # exit non-zero on findings, for CI
-vibegate . --lang ru               # Russian interface
-vibegate . --help
+easyvibegate . --no-wizard             # just scan and print results
+easyvibegate . --deps                  # + dependency vulnerability audit
+easyvibegate . --url https://myapp.com --i-own-this   # + live probe (own apps only)
+easyvibegate . --ci                    # exit non-zero on findings, for CI
+easyvibegate . --lang ru               # Russian interface
+easyvibegate . --help
 ```
 
 ## What it checks
@@ -65,7 +65,7 @@ Against your **running** app, with your confirmation (own apps only):
 
 ## Config & suppressing noise
 
-Add a `vibegate.config.json`:
+Add a `easyvibegate.config.json`:
 
 ```json
 {
@@ -77,15 +77,15 @@ Add a `vibegate.config.json`:
 Or inline, on or above the flagged line:
 
 ```js
-const token = "not-a-real-secret"; // vibegate-ignore
+const token = "not-a-real-secret"; // easyvibegate-ignore
 ```
 
 ## In CI (GitHub Actions)
 
-Add `.github/workflows/vibegate.yml`:
+Add `.github/workflows/easyvibegate.yml`:
 
 ```yaml
-name: VibeGate
+name: EasyVibeGate
 on: [push, pull_request]
 jobs:
   security:
@@ -94,28 +94,28 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
-      - run: npx vibegate . --ci
+      - run: npx easyvibegate . --ci
 ```
 
 Exit codes: `2` = critical found, `1` = warnings, `0` = clean.
 
 ## As an AI-agent skill (Cursor / Claude Code / Windsurf)
 
-The `skills/vibegate/SKILL.md` file makes VibeGate a skill your AI agent can run and reason about
+The `skills/easyvibegate/SKILL.md` file makes EasyVibeGate a skill your AI agent can run and reason about
 (it drives the interactive levels and the IDOR test). Install it by copying the folder into your
 agent's skills directory, e.g.:
 
 ```bash
-cp -r skills/vibegate ~/.claude/skills/vibegate     # Claude Code
+cp -r skills/easyvibegate ~/.claude/skills/easyvibegate     # Claude Code
 ```
 
 ## Config & suppressing noise
 
-See `vibegate.config.json` (`ignore`, `ignorePaths`) and inline `// vibegate-ignore`, above.
+See `easyvibegate.config.json` (`ignore`, `ignorePaths`) and inline `// easyvibegate-ignore`, above.
 
 ## Honest limitations
 
-VibeGate is a **linter for common vibe-coding holes, not a penetration test.** Zero findings does not
+EasyVibeGate is a **linter for common vibe-coding holes, not a penetration test.** Zero findings does not
 mean you are safe. The static layer cannot know whether an endpoint enforces access control — only the
 live probe can, and only against a running app you own. Never point the live probe at systems you do
 not own.

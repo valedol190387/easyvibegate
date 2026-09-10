@@ -11,7 +11,7 @@ export interface VibegateConfig {
 
 const DEFAULT_CONFIG: VibegateConfig = { ignore: [], ignorePaths: [] };
 
-const CONFIG_NAMES = ['vibegate.config.json', '.vibegaterc.json'];
+const CONFIG_NAMES = ['easyvibegate.config.json', '.easyvibegaterc.json'];
 
 export function loadConfig(root: string, explicitPath?: string): VibegateConfig {
   const candidates = explicitPath ? [explicitPath] : CONFIG_NAMES.map((n) => join(root, n));
@@ -29,9 +29,9 @@ export function loadConfig(root: string, explicitPath?: string): VibegateConfig 
   return DEFAULT_CONFIG;
 }
 
-const INLINE_MARKER = 'vibegate-ignore';
+const INLINE_MARKER = 'easyvibegate-ignore';
 
-/** Drop findings suppressed by config rules or inline `// vibegate-ignore` markers. */
+/** Drop findings suppressed by config rules or inline `// easyvibegate-ignore` markers. */
 export function applyIgnores(
   findings: Finding[],
   config: VibegateConfig,

@@ -1,7 +1,7 @@
 ---
-name: vibegate
+name: easyvibegate
 description: >-
-  Run a tiered security audit of the current project with VibeGate: static code
+  Run a tiered security audit of the current project with EasyVibeGate: static code
   review (secrets, exposed keys, missing RLS, dangerous config), an optional
   dependency audit, and — with the user's consent — a live probe of the running
   app and its Supabase/Firebase backend that proves whether data is readable or
@@ -9,19 +9,19 @@ description: >-
   audit RLS/IDOR, or make a vibe-coded app safe to ship.
 ---
 
-# VibeGate skill
+# EasyVibeGate skill
 
-You drive VibeGate as a conversation. Explain each level before running it, and
+You drive EasyVibeGate as a conversation. Explain each level before running it, and
 never probe a live system without the user confirming they own it.
 
 ## 0. Install / locate
-- If the repo has `vibegate` available, run `npx vibegate` (or `node dist/cli/index.js`).
-- Otherwise run from source: `pnpm install && pnpm build` inside the vibegate repo.
+- If the repo has `easyvibegate` available, run `npx easyvibegate` (or `node dist/cli/index.js`).
+- Otherwise run from source: `pnpm install && pnpm build` inside the easyvibegate repo.
 
 ## 1. Level 0 — code review (always safe, no consent needed)
 Run:
 ```
-npx vibegate <project-path> --ai-fix
+npx easyvibegate <project-path>
 ```
 Summarize the findings in plain language, most severe first. Point out the
 critical ones (leaked service_role keys, missing RLS, secrets in the client).
@@ -45,7 +45,7 @@ For the **IDOR test**, this is where you (the AI) add value the CLI cannot:
    each token, compare the responses, and judge whether one user sees another's data.
 
 ## 4. Fix
-Open `vibegate-report/ai-fix-prompt.md` and work through it in order. For leaked
+Open `easyvibegate-report/ai-fix-prompt.md` and work through it in order. For leaked
 secrets, tell the user exactly which keys to rotate — a committed key is already
 burned. For missing RLS, apply the generated SQL migration.
 

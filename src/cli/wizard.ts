@@ -50,7 +50,7 @@ export async function runWizard(args: WizardArgs): Promise<void> {
   };
 
   w();
-  w(`  ${color.bold('🛡  VibeGate')}`);
+  w(`  ${color.bold('🛡  EasyVibeGate')}`);
   w(color.gray(`  ${t(lang, 'wiz.sub1')}`));
   w(color.gray(`  ${t(lang, 'wiz.sub2')}`));
   w();

@@ -43,7 +43,9 @@ const RULES: Rule[] = [
     title: 'SQL built by string interpolation',
     // Requires real query shape: a DML verb + a clause keyword + interpolation,
     // inside one string literal — so prose mentioning "insert" won't match.
-    re: /`[^`]*\b(?:SELECT|INSERT|UPDATE|DELETE)\b[^`]*\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b[^`]*\$\{|f["'][^"'\n]*\b(?:SELECT|INSERT|UPDATE|DELETE)\b[^"'\n]*\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b[^"'\n]*\{/gi,
+    // Quantifiers are length-bounded ({0,200}) to prevent catastrophic
+    // backtracking (ReDoS) on very long / minified lines.
+    re: /`[^`]{0,200}\b(?:SELECT|INSERT|UPDATE|DELETE)\b[^`]{0,200}\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b[^`]{0,200}\$\{|f["'][^"'\n]{0,200}\b(?:SELECT|INSERT|UPDATE|DELETE)\b[^"'\n]{0,200}\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b[^"'\n]{0,200}\{/gi,
     severity: 'warning',
     detail: 'Interpolating values into SQL invites SQL injection.',
     fix: 'Use parameterized queries / prepared statements instead of string interpolation.',

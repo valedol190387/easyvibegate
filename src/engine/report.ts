@@ -52,7 +52,7 @@ function badgeColor(summary: Summary): string {
 }
 
 export function badgeMarkdown(summary: Summary): string {
-  return `![VibeGate](https://img.shields.io/badge/VibeGate-${summary.score}%2F100-${badgeColor(summary)})`;
+  return `![EasyVibeGate](https://img.shields.io/badge/EasyVibeGate-${summary.score}%2F100-${badgeColor(summary)})`;
 }
 
 function stackLine(result: ScanResult): string {
@@ -70,7 +70,7 @@ export function renderConsole(result: ScanResult, summary: Summary, lang: Lang =
     summary.gate === 'fail' ? color.red(color.bold('FAIL')) : color.green(color.bold('PASS'));
 
   lines.push('');
-  lines.push(`${color.bold('🛡  VibeGate')} ${color.gray(`· ${result.fileCount} ${t(lang, 'console.files')} · ${stackLine(result)}`)}`);
+  lines.push(`${color.bold('🛡  EasyVibeGate')} ${color.gray(`· ${result.fileCount} ${t(lang, 'console.files')} · ${stackLine(result)}`)}`);
   lines.push('');
 
   const shown = sortFindings(result.findings);
@@ -137,7 +137,7 @@ export function renderNextSteps(summary: Summary, reportDir: string, lang: Lang 
 
 export function renderMarkdown(result: ScanResult, summary: Summary, lang: Lang = 'en'): string {
   const lines: string[] = [];
-  lines.push('# 🛡 VibeGate Report');
+  lines.push('# 🛡 EasyVibeGate Report');
   lines.push('');
   lines.push(t(lang, 'md.summary', { score: summary.score, gate: summary.gate.toUpperCase(), files: result.fileCount }));
   lines.push('');

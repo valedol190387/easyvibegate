@@ -5,7 +5,7 @@ import type { ScanFile } from './types.js';
 const SKIP_DIRS = new Set([
   '.git', 'node_modules', '.next', 'dist', 'build', 'out', '.venv', 'venv',
   '__pycache__', 'coverage', '.turbo', '.cache', 'vendor', '.svelte-kit',
-  '.nuxt', '.output', 'target', '.idea', '.vscode', 'vibegate-report',
+  '.nuxt', '.output', 'target', '.idea', '.vscode', 'easyvibegate-report',
 ]);
 
 const TEXT_EXT = new Set([

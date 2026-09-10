@@ -1,8 +1,8 @@
-# VibeGate — согласованный технический спек (v0.3 дизайна)
+# EasyVibeGate — согласованный технический спек (v0.3 дизайна)
 
 Универсальный интерактивный сканер безопасности для вайб-кодинговых проектов.
 Один движок проверок, две обёртки: skill (Cursor/Claude) и CLI-визард (терминал).
-Пакет и бинарь: `vibegate` (свободно в npm).
+Пакет и бинарь: `easyvibegate` (свободно в npm).
 
 > Переименован из VibeShield — то имя занято живым коммерческим продуктом vibe-shield.com.
 
@@ -30,7 +30,7 @@
 
 | Вопрос | Решение |
 |---|---|
-| Имя | **VibeGate** (`vibegate`, свободно в npm) |
+| Имя | **EasyVibeGate** (`easyvibegate`, свободно в npm) |
 | Стек инструмента | TypeScript / Node |
 | Форма | Один движок + две обёртки: skill + CLI-визард |
 | Репозиторий | Корень — папка `EasyVibe` |
@@ -39,7 +39,7 @@
 | Ядро | Без обязательных внешних бинарей; тяжёлые инструменты — по запросу |
 | Оценка | Gate (pass/fail по критическим) + балл 0–100 + бейдж |
 | Активная запись (canary) | За отдельным подтверждением; `--read-only` для отката |
-| Ложные срабатывания | `vibegate.config.json` + inline `// vibegate-ignore` |
+| Ложные срабатывания | `easyvibegate.config.json` + inline `// easyvibegate-ignore` |
 
 ## Три уровня (опросник)
 
@@ -69,7 +69,7 @@
 ## Раскладка репозитория
 
 ```
-package.json            # bin: vibegate (CLI-визард)
+package.json            # bin: easyvibegate (CLI-визард)
 tsconfig.json
 src/
   engine/               # чистый детерминированный движок, без UI и без ИИ
@@ -85,7 +85,7 @@ src/
   orchestrator/         # логика уровней и согласий (общая для skill и CLI)
     flow.ts
     prompts.ts
-  cli/index.ts          # терминал-визард; npx vibegate
+  cli/index.ts          # терминал-визард; npx easyvibegate
   skill/SKILL.md        # обёртка для Cursor/Claude — ведёт диалог и даёт адаптивную часть Уровня 2
 templates/report.html
 tests/
@@ -141,6 +141,6 @@ interface Finding {
 ## Позиционирование (чтобы собрать звёзды)
 
 Рынок уже плотный (vibe-audit, vibeship-scanner 127★, VibePenTester 177★, VibeSecurity, vibesafe и др.).
-Ещё один набор commodity-проверок звёзд не даст. Единственное отличие VibeGate — **доказательство, что
+Ещё один набор commodity-проверок звёзд не даст. Единственное отличие EasyVibeGate — **доказательство, что
 дыра стреляет:** не «возможно RLS выключен», а «вот `curl`, которым аноним читает таблицу users, и вот
 SQL, чтобы закрыть». Это и есть крючок для README и постов.

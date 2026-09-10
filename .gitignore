@@ -1,6 +1,6 @@
 node_modules/
 dist/
-vibegate-report/
+easyvibegate-report/
 *.log
 .DS_Store
 .env

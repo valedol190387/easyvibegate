@@ -1,6 +1,6 @@
 # VibeShield — предложение по продукту
 
-> Рабочее название: **VibeShield** (свободны также `vibegate`, `safevibe`, `vibescan`).
+> Рабочее название: **VibeShield** (свободны также `easyvibegate`, `safevibe`, `vibescan`).
 > Заняты: `vibe-audit`, `vibecheck`, `vibeguard`, `vibesecurity`.
 
 Open-source сканер безопасности для «вайб-кодинговых» проектов. Одна команда, любой стек,

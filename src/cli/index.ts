@@ -43,20 +43,20 @@ interface Args {
 }
 
 const HELP = `
-🛡  vibegate — universal security scanner for vibe-coded apps
+🛡  easyvibegate — universal security scanner for vibe-coded apps
 
 Usage:
-  vibegate [path] [options]
+  easyvibegate [path] [options]
 
-Just run \`vibegate\` in your project for a guided, beginner-friendly wizard.
+Just run \`easyvibegate\` in your project for a guided, beginner-friendly wizard.
 Level 0 (static, any stack) always runs. Level 1/2 need opt-in.
 A fix plan (ai-fix-prompt.md) is always written next to the report.
 
 Options:
-  -o, --output <dir>     Report directory (default: ./vibegate-report)
+  -o, --output <dir>     Report directory (default: ./easyvibegate-report)
   -f, --format <fmt>     all | md | json | none (default: all)
       --ci               Quiet; exit non-zero on findings (2 critical, 1 warning)
-  -c, --config <file>    Path to a vibegate config JSON
+  -c, --config <file>    Path to a easyvibegate config JSON
 
   Level 1:
       --deps             Run the dependency vulnerability audit
@@ -83,7 +83,7 @@ Ethics: the live probe sends real requests. Only run it against systems you own.
 function parseArgs(argv: string[]): Args {
   const a: Args = {
     path: '.',
-    output: 'vibegate-report',
+    output: 'easyvibegate-report',
     format: 'all',
     ci: false,
     iOwnThis: false,
@@ -142,7 +142,7 @@ function ask(question: string): Promise<string> {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) { process.stdout.write(HELP); return; }
-  if (args.version) { process.stdout.write(`vibegate ${VERSION}\n`); return; }
+  if (args.version) { process.stdout.write(`easyvibegate ${VERSION}\n`); return; }
 
   const root = resolve(args.path);
   const autoYes = args.iOwnThis || args.yes;
@@ -217,6 +217,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  process.stderr.write(`vibegate: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
+  process.stderr.write(`easyvibegate: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);
   process.exit(1);
 });

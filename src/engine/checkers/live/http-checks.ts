@@ -1,5 +1,5 @@
 import type { Finding } from '../../types.js';
-import { isErr, request } from '../../net/http.js';
+import { isErr, request, requestFollow } from '../../net/http.js';
 
 interface ExposedProbe {
   path: string;
@@ -57,8 +57,8 @@ export async function checkLiveSite(appUrl: string): Promise<Finding[]> {
     });
   }
 
-  // Follow redirects so headers are read from the real page, not a 301/302 hop.
-  const root = await request(base + '/', { redirect: 'follow' });
+  // Follow redirects (bounded) so headers are read from the real page, not a 301/302 hop.
+  const root = await requestFollow(base + '/');
   if (!isErr(root)) {
     for (const h of SECURITY_HEADERS) {
       if (!root.headers.get(h.header)) {

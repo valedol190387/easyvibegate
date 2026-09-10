@@ -25,7 +25,7 @@ export const routeInventoryChecker: Checker = {
       severity: 'advisory',
       title: `${endpoints.length} endpoint(s) discovered`,
       detail: `Targets for the Level 2 live probe: ${preview}${more}. Static analysis cannot tell if these enforce access control — run the live probe to confirm.`,
-      fix: 'Run VibeGate Level 2 against the running app to test each endpoint without auth and, with two accounts, for cross-user access (IDOR).',
+      fix: 'Run EasyVibeGate Level 2 against the running app to test each endpoint without auth and, with two accounts, for cross-user access (IDOR).',
       checker: 'route-inventory',
       level: 0,
     };

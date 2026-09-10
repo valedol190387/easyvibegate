@@ -1,10 +1,10 @@
 {
-  "name": "vibegate",
+  "name": "easyvibegate",
   "version": "0.2.0",
   "description": "Universal, interactive security scanner for vibe-coded apps. Proves the hole fires, not just guesses it.",
   "type": "module",
   "bin": {
-    "vibegate": "dist/cli/index.js"
+    "easyvibegate": "dist/cli/index.js"
   },
   "files": [
     "dist"
@@ -16,7 +16,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "pnpm build",
-    "vibegate": "node dist/cli/index.js"
+    "easyvibegate": "node dist/cli/index.js"
   },
   "author": "valedol190387 (https://github.com/valedol190387)",
   "repository": {
