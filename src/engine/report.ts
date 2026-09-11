@@ -118,7 +118,7 @@ function gateLabel(summary: Summary): string {
 export function renderConsole(result: ScanResult, summary: Summary, lang: Lang = 'en'): string {
   const lines: string[] = [];
   lines.push('');
-  lines.push(`${color.bold('🛡  EasyVibeGate')} ${color.gray(`· ${result.fileCount} ${t(lang, 'console.files')} · ${stackLine(result)}`)}`);
+  lines.push(`${color.bold('🛡  EasyVibeGate')} ${color.gray(`· ${t(lang, 'console.filesLine', { n: result.fileCount })} · ${stackLine(result)}`)}`);
   lines.push('');
 
   const shown = sortFindings(result.findings);

@@ -386,9 +386,15 @@ await (async () => {
     'supabase/migrations/20240101_init.sql': 'CREATE TABLE public.notes (id uuid);\n',
   });
   const r = await scanStatic(dir);
-  check('RLS enabled in a file that sorts first is still respected', () => {
+  // Previously this asserted silence. Staying silent whenever an ENABLE existed
+  // anywhere is precisely what let a DISABLE in a later migration slip through,
+  // so the contract is now: report it, but as a warning naming the ambiguity —
+  // no false critical, and no silence either.
+  check('RLS enabled in a file that sorts first is reported as ambiguous, not dropped', () => {
     const rls = r.findings.filter((f) => f.id === 'rls_missing');
-    assert.strictEqual(rls.length, 0, rls.map((f) => f.title).join(', '));
+    assert.strictEqual(rls.length, 1, `expected one ambiguous finding, got ${rls.length}`);
+    assert.strictEqual(rls[0].severity, 'warning');
+    assert.match(rls[0].title, /order unclear/i);
   });
   rmSync(dir, { recursive: true, force: true });
 })();
@@ -692,6 +698,193 @@ await (async () => {
   });
   rmSync(dir, { recursive: true, force: true });
 })();
+
+
+// --- Regression: the four defects found by the v0.4.1 external audit ---------
+console.log('\nregressions (v0.4.1 audit)');
+
+await (async () => {
+  // Rules that match a literal value must still SEE that literal. Masking every
+  // quoted string had silently disabled these three detectors entirely.
+  const dir = fixture({
+    'jwt.ts': 'const opts = { algorithm: "none" };\n',
+    'cors.ts': 'app.use(cors({origin: "*"}));\n',
+    'q.py': 'query = f"SELECT * FROM users WHERE id = {user_id}"\n',
+  });
+  const r = await scanStatic(dir);
+  check('alg "none" in a quoted value is still detected', () => {
+    assert.ok(ids(r).includes('jwt_alg_none'), `got ${ids(r)}`);
+  });
+  check('CORS origin "*" is still detected', () => {
+    assert.ok(ids(r).includes('cors_star'), `got ${ids(r)}`);
+  });
+  check('Python f-string SQL interpolation is still detected', () => {
+    assert.ok(ids(r).includes('sql_interpolation'), `got ${ids(r)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // Negative half: the same words inside comments must stay silent.
+  const dir2 = fixture({
+    'c.ts': '// never set algorithm: "none" and never use origin: "*"\n/* eval( */\n',
+  });
+  const r2 = await scanStatic(dir2);
+  check('the same constructs inside comments are NOT reported', () => {
+    assert.deepStrictEqual(r2.findings.filter((f) => f.checker === 'config-risks'), []);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+})();
+
+await (async () => {
+  // A later migration in the SAME directory has a real apply order: a DISABLE
+  // there must win over an earlier ENABLE.
+  const dir = fixture({
+    'supabase/migrations/001.sql': 'CREATE TABLE public.orders(id uuid);\nALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n',
+    'supabase/migrations/002.sql': 'ALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n',
+  });
+  const r = await scanStatic(dir);
+  check('RLS disabled by a later migration is reported as critical', () => {
+    const f = r.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `expected rls_missing, got ${ids(r)}`);
+    assert.strictEqual(f.severity, 'critical');
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  const dir2 = fixture({
+    'supabase/migrations/001.sql': 'CREATE TABLE public.orders(id uuid);\nALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n',
+    'supabase/migrations/002.sql': 'DROP TABLE public.orders;\nCREATE TABLE public.orders(id uuid);\n',
+  });
+  const r2 = await scanStatic(dir2);
+  check('a table recreated in a later migration loses its RLS and is reported', () => {
+    assert.ok(ids(r2).includes('rls_missing'), `got ${ids(r2)}`);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+
+  // Negative half: enabled and left alone must stay clean.
+  const dir3 = fixture({
+    'supabase/migrations/001.sql': 'CREATE TABLE public.orders(id uuid);\nALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n',
+    'supabase/migrations/002.sql': 'CREATE INDEX ON public.orders(id);\n',
+  });
+  const r3 = await scanStatic(dir3);
+  check('a table left with RLS enabled is not reported', () => {
+    assert.ok(!ids(r3).includes('rls_missing'), `got ${ids(r3)}`);
+  });
+  rmSync(dir3, { recursive: true, force: true });
+
+})();
+
+await (async () => {
+  // The closing $$ of a DO block used to be read as a new opening delimiter,
+  // blanking the whole rest of the file — hiding every statement after it.
+  const dir = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders(id uuid);\nDO $$ BEGIN\n  ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\nEND $$;\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n',
+  });
+  const r = await scanStatic(dir);
+  check('SQL after a DO $$ ... $$ block is still analyzed', () => {
+    assert.ok(ids(r).includes('rls_missing'), `got ${ids(r)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  const dir2 = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders(id uuid);\nDO $$ BEGIN\n  ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\nEND $$;\n',
+  });
+  const r2 = await scanStatic(dir2);
+  check('DDL inside a DO block still counts as executed', () => {
+    assert.ok(!ids(r2).includes('rls_missing'), `got ${ids(r2)}`);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+})();
+
+await (async () => {
+  // An empty stdin is "no answer", not an Enter accepting the default.
+  const dir = fixture({ 'ok.ts': 'const a = 1;\n' });
+  const p = runCli([dir, '--wizard', '--format', 'none'], { input: '' });
+  check('empty stdin does not auto-accept the dependency-audit question', () => {
+    assert.ok(!/Level 1|dependency audit/i.test(p.stdout + p.stderr), `deps ran on empty stdin: ${(p.stdout + p.stderr).slice(0, 200)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  // A live check that was explicitly requested but never authorized is missing
+  // coverage — it must not exit 0 as a clean PASS.
+  const dir = fixture({ 'ok.ts': 'const a = 1;\n' });
+  const p = runCli([dir, '--ci', '--format', 'none', '--url', 'https://synthetic.invalid'], { input: '' });
+  check('--ci --url without ownership fails loudly instead of passing', () => {
+    assert.notStrictEqual(p.status, 0, `exited 0 without running the requested live check: ${p.stderr}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+
+
+// --- Regression: v0.4.2 audit — unjustified 100/100 PASS in two RLS shapes ----
+console.log('\nregressions (v0.4.2 audit)');
+
+await (async () => {
+  // Cross-directory ambiguity is symmetric. An ENABLE that merely sorts LAST is
+  // no more trustworthy than one that sorts first — checking only the RLS-off
+  // direction let this exact shape pass clean.
+  const dir = fixture({
+    'a/001.sql': 'CREATE TABLE public.orders (id serial);\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n',
+    'z/001.sql': 'ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n',
+  });
+  const r = await scanStatic(dir);
+  check('ENABLE that merely sorts last does not produce a confident PASS', () => {
+    const f = r.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `expected an ambiguity finding, got ${ids(r)}`);
+    assert.strictEqual(f.severity, 'warning');
+    assert.match(f.title, /order unclear/i);
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // Same two statements in ONE directory: order is real, so the verdict is firm.
+  const dir2 = fixture({
+    'db/001.sql': 'CREATE TABLE public.orders (id serial);\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n',
+    'db/002.sql': 'ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n',
+  });
+  const r2 = await scanStatic(dir2);
+  check('the same statements within one directory stay a firm verdict', () => {
+    assert.ok(!ids(r2).includes('rls_missing'), `got ${r2.findings.map((f) => f.title)}`);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+})();
+
+await (async () => {
+  // A guarded ENABLE cannot be confirmed statically — the verdict must say so
+  // rather than report a confident 100/100 PASS.
+  const dir = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders (id serial);\nDO $$ BEGIN\n  IF false THEN\n    ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n  END IF;\nEND $$;\n',
+  });
+  const r = await scanStatic(dir);
+  check('conditional ENABLE inside a DO block is reported, not assumed', () => {
+    const f = r.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `expected a finding, got ${ids(r)}`);
+    assert.strictEqual(f.severity, 'warning');
+    assert.match(f.title, /conditional/i);
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // Unconditional DDL in a DO block is still trusted — no false warning.
+  const dir2 = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders (id serial);\nDO $$ BEGIN\n  ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\nEND $$;\n',
+  });
+  const r2 = await scanStatic(dir2);
+  check('unconditional ENABLE inside a DO block raises no doubt', () => {
+    assert.ok(!ids(r2).includes('rls_missing'), `got ${r2.findings.map((f) => f.title)}`);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+
+  // A later unconditional ENABLE clears the doubt a guarded one left.
+  const dir3 = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders (id serial);\nDO $$ BEGIN\n  IF false THEN\n    ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n  END IF;\nEND $$;\nALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n',
+  });
+  const r3 = await scanStatic(dir3);
+  check('a later unconditional ENABLE clears the conditional doubt', () => {
+    assert.ok(!ids(r3).includes('rls_missing'), `got ${r3.findings.map((f) => f.title)}`);
+  });
+  rmSync(dir3, { recursive: true, force: true });
+})();
+
 
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

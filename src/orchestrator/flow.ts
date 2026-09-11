@@ -128,10 +128,14 @@ export async function runFlow(opts: FlowOptions): Promise<ScanResult> {
         }
       }
     } else {
-      // Record every check the user asked for, so declining is visible as coverage.
-      runs.push({ id: 'live-site', level: 2, status: 'skipped', note: 'declined' });
-      runs.push({ id: 'endpoint-probe', level: 2, status: 'skipped', note: 'declined' });
-      if (opts.idorTokens) runs.push({ id: 'idor', level: 2, status: 'skipped', note: 'declined' });
+      // A URL only reaches here because the caller explicitly asked for it, so
+      // this is a check that was REQUESTED and did not run. That is missing
+      // coverage, not a clean result: `unsupported` makes the gate incomplete,
+      // where `skipped` would have let a never-run live check exit 0 as PASS.
+      const note = 'requested but not authorized — ownership was not confirmed';
+      runs.push({ id: 'live-site', level: 2, status: 'unsupported', note });
+      runs.push({ id: 'endpoint-probe', level: 2, status: 'unsupported', note });
+      if (opts.idorTokens) runs.push({ id: 'idor', level: 2, status: 'unsupported', note });
     }
   }
 

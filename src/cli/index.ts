@@ -229,6 +229,21 @@ async function main(): Promise<void> {
   // --ci is a non-interactive contract: never ask questions there.
   const useWizard = !args.ci && (args.wizard || (!args.noWizard && !autoYes && !!process.stdin.isTTY));
 
+  // Asking for a live check in a run that can never confirm ownership is a
+  // misconfigured invocation, not a clean scan. Fail on the flags rather than
+  // silently skipping the very check the run was set up to perform.
+  const canConfirmOwnership = autoYes || useWizard || !!process.stdin.isTTY;
+  if (!canConfirmOwnership) {
+    const requested = [args.appUrl ? '--url' : '', args.supabaseUrl ? '--supabase-url' : ''].filter(Boolean);
+    if (requested.length > 0) {
+      process.stderr.write(
+        `easyvibegate: ${requested.join(' and ')} asks for a live check, but this run is non-interactive and cannot confirm you own the target.\n` +
+        'Add --i-own-this to assert ownership, or run it in a terminal.\n',
+      );
+      process.exit(2);
+    }
+  }
+
   let result;
   if (useWizard) {
     result = await runWizard({

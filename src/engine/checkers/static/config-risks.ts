@@ -9,6 +9,14 @@ interface Rule {
   severity: Severity;
   detail: string;
   fix: string;
+  /**
+   * Whether quoted strings must be blanked before this rule runs.
+   * Some rules look for a *literal value* (`"none"`, `"*"`, an f-string query) —
+   * blanking strings deletes the very thing they match, so they must see the
+   * source with only comments removed. Rules that look for *code* (eval) blank
+   * strings so that the word inside a string is not reported.
+   */
+  maskStrings: boolean;
 }
 
 const RULES: Rule[] = [
@@ -19,6 +27,7 @@ const RULES: Rule[] = [
     severity: 'warning',
     detail: 'The API allows any origin ("*"). If it also allows credentials this is a serious CORS hole; even without credentials it widens exposure.',
     fix: 'Set an explicit allowlist of origins instead of "*", and never combine "*" with credentials.',
+    maskStrings: false,
   },
   {
     id: 'debug_on',
@@ -27,6 +36,7 @@ const RULES: Rule[] = [
     severity: 'warning',
     detail: 'Debug mode leaks stack traces and internals to visitors in production.',
     fix: 'Drive debug from an env var and keep it off in production.',
+    maskStrings: true,
   },
   {
     id: 'eval_use',
@@ -35,6 +45,7 @@ const RULES: Rule[] = [
     severity: 'warning',
     detail: 'eval on any untrusted input is a code-execution risk.',
     fix: 'Replace eval with explicit parsing/logic; never eval user-supplied data.',
+    maskStrings: true,
   },
   {
     id: 'sql_interpolation',
@@ -47,6 +58,7 @@ const RULES: Rule[] = [
     severity: 'warning',
     detail: 'Interpolating values into SQL invites SQL injection.',
     fix: 'Use parameterized queries / prepared statements instead of string interpolation.',
+    maskStrings: false,
   },
   {
     id: 'jwt_alg_none',
@@ -55,6 +67,7 @@ const RULES: Rule[] = [
     severity: 'critical',
     detail: 'alg:none disables signature verification — anyone can forge a valid token.',
     fix: 'Require a real signing algorithm (e.g. HS256/RS256) and reject "none".',
+    maskStrings: false,
   },
 ];
 
@@ -69,10 +82,12 @@ export const configRisksChecker: Checker = {
       // Config risks in prose docs are examples, not live config — skip them.
       if (file.rel.endsWith('.md') || file.rel.endsWith('.txt')) continue;
       if (looksMinified(file.rel, file.content)) continue; // generated output, not source
-      // Comments and quoted strings must not trigger rules; backticks stay so the
-      // SQL-interpolation rule can still see template literals.
-      const scan = maskCode(file.content, { strings: true });
+      // Comments never trigger a rule. Strings are a per-rule decision: a rule
+      // matching a literal value must still see it (see Rule.maskStrings).
+      const noComments = maskCode(file.content);
+      const noStrings = maskCode(file.content, { strings: true });
       for (const rule of RULES) {
+        const scan = rule.maskStrings ? noStrings : noComments;
         for (const m of scan.matchAll(rule.re)) {
           findings.push({
             id: rule.id,

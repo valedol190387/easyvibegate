@@ -4,7 +4,7 @@ type Dict = Record<string, string>;
 
 const EN: Dict = {
   // console
-  'console.files': 'files',
+  'console.filesLine': '{n} files',
   'console.none': 'No findings. (Zero findings does not guarantee safety — run Level 2 on the live app.)',
   'console.evidence': 'evidence',
   'console.fix': 'fix',
@@ -95,7 +95,7 @@ const EN: Dict = {
 };
 
 const RU: Dict = {
-  'console.files': 'файлов',
+  'console.filesLine': 'файлов: {n}',
   'console.none': 'Находок нет. (Ноль находок не гарантирует безопасность — запусти живую проверку, Уровень 2.)',
   'console.evidence': 'улика',
   'console.fix': 'как чинить',

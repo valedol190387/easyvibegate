@@ -44,11 +44,19 @@ export function normalizeUrl(input: string): string | null {
   }
 }
 
-/** Read every line from a non-TTY stdin up front, so piped answers are not lost. */
+/**
+ * Read every line from a non-TTY stdin up front, so piped answers are not lost.
+ * An empty stream is zero answers, not one blank line: `''.split('\n')` yields
+ * `['']`, which reads as a deliberate Enter and would accept a question's
+ * default — opting into a network action nobody asked for. The trailing newline
+ * of a normal stream is dropped for the same reason.
+ */
 async function readPipedLines(): Promise<string[]> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
-  return Buffer.concat(chunks).toString('utf8').split('\n');
+  const text = Buffer.concat(chunks).toString('utf8');
+  if (text === '') return [];
+  return text.replace(/\r?\n$/, '').split('\n');
 }
 
 /**
