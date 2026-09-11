@@ -6,6 +6,10 @@ const SKIP_DIRS = new Set([
   '.git', 'node_modules', '.next', 'dist', 'build', 'out', '.venv', 'venv',
   '__pycache__', 'coverage', '.turbo', '.cache', 'vendor', '.svelte-kit',
   '.nuxt', '.output', 'target', '.idea', '.vscode', 'easyvibegate-report',
+  // Installed third-party code, not the user's own. Matching only the venv
+  // folder names above misses a venv called anything else (tools/ytenv/...),
+  // and then every key inside a vendored library is reported as the user's leak.
+  'site-packages', '__pypackages__', 'bower_components', 'Pods',
 ]);
 
 const TEXT_EXT = new Set([

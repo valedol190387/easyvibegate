@@ -41,8 +41,17 @@ export function maskSql(sql: string): string {
       blank(i, j); i = j; continue;
     }
     if (ch === '/' && next === '*') {
-      const close = sql.indexOf('*/', i + 2);
-      const end = close === -1 ? n : close + 2;
+      // PostgreSQL block comments NEST: in `/* a /* b */ still a comment */` the
+      // first `*/` closes only the inner one. Stopping there un-commented the
+      // rest and made commented-out DDL look like executed DDL.
+      let depth = 0;
+      let j = i;
+      while (j < n) {
+        if (sql[j] === '/' && sql[j + 1] === '*') { depth++; j += 2; continue; }
+        if (sql[j] === '*' && sql[j + 1] === '/') { depth--; j += 2; if (depth === 0) break; continue; }
+        j++;
+      }
+      const end = depth === 0 ? j : n;
       blank(i, end); i = end; continue;
     }
     if (ch === "'") {
@@ -72,8 +81,10 @@ export function maskSql(sql: string): string {
           // blank the entire rest of the file, hiding every later statement.
           const inner = maskSql(sql.slice(bodyStart, bodyEnd));
           for (let k = 0; k < inner.length; k++) out[bodyStart + k] = inner[k] as string;
-          blank(i, bodyStart);
-          blank(bodyEnd, end);
+          // The `$$` delimiters stay VISIBLE on purpose: guard analysis reads this
+          // same masked text and needs them to find the block. Sharing one masked
+          // string is what keeps masking and guard parsing from disagreeing about
+          // what is a string or a comment.
           i = end; continue;
         }
         blank(i, end); i = end; continue;
@@ -98,26 +109,6 @@ interface Event {
 }
 
 /**
- * Blank out only comments, preserving length and the `$$` delimiters that
- * `maskSql` removes. Guard analysis needs the delimiters to find DO blocks, but
- * must not read `-- end if` in a comment as a real block terminator.
- */
-function maskSqlComments(sql: string): string {
-  const out = sql.split('');
-  const n = sql.length;
-  const blank = (from: number, to: number) => {
-    for (let k = from; k < to && k < n; k++) if (out[k] !== '\n') out[k] = ' ';
-  };
-  let i = 0;
-  while (i < n) {
-    if (sql[i] === '-' && sql[i + 1] === '-') { let j = i; while (j < n && sql[j] !== '\n') j++; blank(i, j); i = j; continue; }
-    if (sql[i] === '/' && sql[i + 1] === '*') { const c = sql.indexOf('*/', i + 2); const end = c === -1 ? n : c + 2; blank(i, end); i = end; continue; }
-    i++;
-  }
-  return out.join('');
-}
-
-/**
  * Spans inside a `DO $$ … $$` body that sit between an `IF … THEN` and its
  * `END IF`. DDL there runs only when the condition holds, and deciding that
  * needs an interpreter — so statements in these spans are reported as
@@ -126,10 +117,13 @@ function maskSqlComments(sql: string): string {
  * IFs nest, so this matches them with a stack: taking the first `END IF` as the
  * outer block's terminator ends the guard early and lets a statement after the
  * inner `END IF` look unconditional. `ELSIF` is not an opener (`\bif\b` does not
- * match inside it). Offsets are preserved, so they line up with `maskSql` output.
+ * match inside it).
+ *
+ * Takes the SAME masked text the statements are read from, so `'end if'` inside a
+ * string literal or a comment cannot terminate a guard — two separate parsers
+ * disagreeing about that is exactly how such statements slipped through.
  */
-function conditionalRanges(sql: string): Array<[number, number]> {
-  const src = maskSqlComments(sql);
+function conditionalRanges(src: string): Array<[number, number]> {
   const ranges: Array<[number, number]> = [];
   for (const m of src.matchAll(/\bdo\s*(\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$)/gi)) {
     const tag = m[1] as string;
@@ -184,10 +178,7 @@ export const rlsMigrationsChecker: Checker = {
     const events: Event[] = [];
     sqlFiles.forEach((f, fileIdx) => {
       const masked = maskSql(f.content);
-      // Computed on the raw text: maskSql blanks the `$$` delimiters themselves,
-      // so the DO blocks are no longer findable there. It preserves length, so
-      // offsets from `masked` line up with these ranges exactly.
-      const guards = conditionalRanges(f.content);
+      const guards = conditionalRanges(masked);
       const push = (kind: Event['kind'], schema: string | undefined, table: string, offset: number, ifNotExists = false) =>
         events.push({
           kind, key: keyOf(schema, table), ifNotExists, file: f.rel, line: lineAt(f.content, offset),

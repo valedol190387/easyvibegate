@@ -945,6 +945,79 @@ await (async () => {
   rmSync(dir5, { recursive: true, force: true });
 })();
 
+// --- Regression: v0.4.4 audit — the two SQL parsers disagreed -----------------
+console.log('\nregressions (v0.4.4 audit)');
+
+await (async () => {
+  // 'end if' inside a STRING must not terminate a guard. Guard parsing used to
+  // run over a separately-masked text that kept string contents.
+  const dir = fixture({
+    'db/1.sql': "CREATE TABLE public.orders (id serial);\nDO $$ BEGIN\n  IF false THEN\n    RAISE NOTICE 'end if';\n    ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n  END IF;\nEND $$;\n",
+  });
+  const r = await scanStatic(dir);
+  check("'end if' inside a string literal does not close the guard", () => {
+    assert.ok(ids(r).includes('rls_missing'), `got ${ids(r)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // Same, via a dollar-quoted string.
+  const dir2 = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders (id serial);\nDO $$ BEGIN\n  IF false THEN\n    RAISE NOTICE $msg$end if$msg$;\n    ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n  END IF;\nEND $$;\n',
+  });
+  const r2 = await scanStatic(dir2);
+  check('"end if" inside a dollar-quoted string does not close the guard', () => {
+    assert.ok(ids(r2).includes('rls_missing'), `got ${ids(r2)}`);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+
+  // PostgreSQL block comments nest: the first */ closes only the inner one, so
+  // the ENABLE below stayed commented out and must not count.
+  const dir3 = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders (id serial);\n/* outer\n   /* inner */\n   ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n*/\n',
+  });
+  const r3 = await scanStatic(dir3);
+  check('a commented-out ENABLE inside nested block comments does not count', () => {
+    const f = r3.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `commented-out DDL was treated as executed: got ${ids(r3)}`);
+    assert.strictEqual(f.severity, 'critical');
+  });
+  rmSync(dir3, { recursive: true, force: true });
+
+  // Negative half: a plain, properly closed block comment still ends where it should.
+  const dir4 = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders (id serial);\n/* just a note */\nALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n',
+  });
+  const r4 = await scanStatic(dir4);
+  check('a normal block comment does not swallow the SQL after it', () => {
+    assert.ok(!ids(r4).includes('rls_missing'), `got ${r4.findings.map((f) => f.title)}`);
+  });
+  rmSync(dir4, { recursive: true, force: true });
+})();
+
+// --- Regression: vendored third-party code is not the user's leak ------------
+await (async () => {
+  // A virtualenv named anything but venv/.venv (e.g. tools/ytenv) put every key
+  // inside installed libraries into the report as the user's own critical.
+  const dir = fixture({
+    'tools/ytenv/lib/python3.12/site-packages/google/auth/helper.py':
+      '-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----\n',
+    'app.py': 'x = 1\n',
+  });
+  const r = await scanStatic(dir);
+  check('keys inside site-packages are not reported as the project’s own', () => {
+    assert.deepStrictEqual(ids(r).filter((i) => i === 'private_key'), [], 'vendored library code must be skipped');
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // Negative half: the same key in the user's own code is still critical.
+  const dir2 = fixture({ 'keys/id_rsa.pem': '-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----\n' });
+  const r2 = await scanStatic(dir2);
+  check('a private key in the project’s own code is still reported', () => {
+    assert.ok(ids(r2).includes('private_key'), `got ${ids(r2)}`);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+})();
+
 // --- Liveness: every static detector must still FIRE on its own target -------
 // Three detectors were once silently disabled by "fix the false positive"
 // changes while the suite stayed green, because those tests only asserted that
