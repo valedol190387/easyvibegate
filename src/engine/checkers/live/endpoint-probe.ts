@@ -1,7 +1,12 @@
-import type { Finding } from '../../types.js';
+import type { CheckRun, Finding } from '../../types.js';
 import type { Endpoint } from '../../endpoints.js';
 import { concretePath } from '../../endpoints.js';
 import { isErr, request, sleep } from '../../net/http.js';
+
+export interface EndpointProbeResult {
+  findings: Finding[];
+  run: CheckRun;
+}
 
 function looksLikeData(body: string): boolean {
   const t = body.trim();
@@ -19,17 +24,21 @@ export async function probeEndpointsUnauth(
   appUrl: string,
   endpoints: Endpoint[],
   rateLimitMs = 100,
-): Promise<Finding[]> {
+): Promise<EndpointProbeResult> {
   const base = appUrl.replace(/\/$/, '');
   const findings: Finding[] = [];
 
   const targets = endpoints.filter((e) => e.method === 'GET' || e.method === 'ANY').slice(0, 60);
+  if (targets.length === 0) {
+    return { findings, run: { id: 'endpoint-probe', level: 2, status: 'skipped', note: 'no GET endpoints discovered' } };
+  }
 
+  let errors = 0;
   for (const e of targets) {
     await sleep(rateLimitMs);
     const path = concretePath(e.path).replace(/^\/?/, '/');
     const res = await request(base + path, { headers: { accept: 'application/json' } });
-    if (isErr(res)) continue;
+    if (isErr(res)) { errors++; continue; }
     if (res.status !== 200) continue;
     if (!looksLikeData(res.body)) continue;
 
@@ -46,5 +55,7 @@ export async function probeEndpointsUnauth(
     });
   }
 
-  return findings;
+  const status = errors === 0 ? 'completed' : errors < targets.length ? 'partial' : 'failed';
+  const note = errors > 0 ? `${errors}/${targets.length} endpoint requests errored` : undefined;
+  return { findings, run: { id: 'endpoint-probe', level: 2, status, note } };
 }

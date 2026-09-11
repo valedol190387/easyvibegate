@@ -18,8 +18,8 @@ const RULES: Rule[] = [
     title: 'CORS open to any origin',
     re: /Access-Control-Allow-Origin["']?\s*[:,]\s*["']\*["']|origin\s*:\s*["']\*["']/g,
     severity: 'warning',
-    detail: 'The API allows requests from any origin, which lets any site call it with the user\'s cookies.',
-    fix: 'Set an explicit allowlist of origins instead of "*", especially for credentialed requests.',
+    detail: 'The API allows any origin ("*"). If it also allows credentials this is a serious CORS hole; even without credentials it widens exposure.',
+    fix: 'Set an explicit allowlist of origins instead of "*", and never combine "*" with credentials.',
   },
   {
     id: 'debug_on',

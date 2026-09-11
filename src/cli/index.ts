@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { runFlow, type ConsentRequest } from '../orchestrator/flow.js';
 import {
   badgeMarkdown,
+  coverage,
   renderConsole,
   renderJson,
   renderMarkdown,
@@ -32,12 +33,13 @@ interface Args {
   supabaseKey?: string;
   iOwnThis: boolean;
   yes: boolean;
-  write: boolean;
   deps: boolean;
   noWizard: boolean;
   wizard: boolean;
   lang?: string;
   idorTokens?: [string, string];
+  badIdorTokens: boolean;
+  unknown: string[];
   help: boolean;
   version: boolean;
 }
@@ -68,10 +70,9 @@ Options:
       --idor-tokens a,b  Two bearer tokens for the IDOR differential probe
       --i-own-this       Authorize probing without interactive prompts (for CI)
   -y, --yes              Assume yes to all consent prompts
-      --write            Allow canary write probes (default: read-only)
 
   Other:
-      --lang <en|ru>     Interface language (default: from your locale, else en)
+      --lang <ru|en>     Interface language (default: ru; use "en" for English)
       --no-wizard        Skip the guided wizard; run directly and print results
 
   -h, --help             Show help
@@ -88,10 +89,11 @@ function parseArgs(argv: string[]): Args {
     ci: false,
     iOwnThis: false,
     yes: false,
-    write: false,
     deps: false,
     noWizard: false,
     wizard: false,
+    badIdorTokens: false,
+    unknown: [],
     help: false,
     version: false,
   };
@@ -116,7 +118,6 @@ function parseArgs(argv: string[]): Args {
       case '--supabase-key': a.supabaseKey = argv[++i]; break;
       case '--i-own-this': a.iOwnThis = true; break;
       case '-y': case '--yes': a.yes = true; break;
-      case '--write': a.write = true; break;
       case '--deps': a.deps = true; break;
       case '--no-wizard': case '--scan': a.noWizard = true; break;
       case '--wizard': a.wizard = true; break;
@@ -125,10 +126,12 @@ function parseArgs(argv: string[]): Args {
         const v = argv[++i] ?? '';
         const parts = v.split(',').map((s) => s.trim()).filter(Boolean);
         if (parts.length === 2) a.idorTokens = [parts[0]!, parts[1]!];
+        else a.badIdorTokens = true;
         break;
       }
       default:
-        if (!arg.startsWith('-') && !sawPath) { a.path = arg; sawPath = true; }
+        if (arg.startsWith('-')) a.unknown.push(arg);
+        else if (!sawPath) { a.path = arg; sawPath = true; }
     }
   }
   return a;
@@ -144,13 +147,27 @@ async function main(): Promise<void> {
   if (args.help) { process.stdout.write(HELP); return; }
   if (args.version) { process.stdout.write(`easyvibegate ${VERSION}\n`); return; }
 
+  // Fail loudly on bad usage instead of silently doing the wrong thing.
+  if (args.unknown.length > 0) {
+    process.stderr.write(`easyvibegate: unknown option(s): ${args.unknown.join(', ')}\nRun with --help.\n`);
+    process.exit(2);
+  }
+  if (args.badIdorTokens) {
+    process.stderr.write('easyvibegate: --idor-tokens needs exactly two comma-separated tokens (tokenA,tokenB).\n');
+    process.exit(2);
+  }
+
   const root = resolve(args.path);
+  if (!existsSync(root) || !statSync(root).isDirectory()) {
+    process.stderr.write(`easyvibegate: path not found or not a directory: ${root}\n`);
+    process.exit(2);
+  }
   const autoYes = args.iOwnThis || args.yes;
   const lang = pickLang(args.lang);
 
   // Default to the friendly wizard when a human runs it in a terminal without
   // any automation/power flags. CI and flag-driven runs use direct mode.
-  const powerFlags = args.ci || autoYes || !!args.appUrl || !!args.supabaseUrl || !!args.idorTokens || args.deps || args.write;
+  const powerFlags = args.ci || autoYes || !!args.appUrl || !!args.supabaseUrl || !!args.idorTokens || args.deps;
   if (args.wizard || (!args.noWizard && !powerFlags && !!process.stdin.isTTY)) {
     await runWizard({ path: args.path, output: args.output, config: args.config, lang });
     return;
@@ -176,7 +193,6 @@ async function main(): Promise<void> {
     supabaseUrl: args.supabaseUrl,
     supabaseKey: args.supabaseKey,
     runDeps: args.deps,
-    writeProbe: args.write,
     idorTokens: args.idorTokens,
     consent,
     log,
@@ -207,12 +223,16 @@ async function main(): Promise<void> {
   }
 
   if (!args.ci) {
-    process.stdout.write(renderVerdict(summary, lang) + '\n\n');
+    process.stdout.write(renderVerdict(summary, result.runs, lang) + '\n\n');
     if (args.format !== 'none') process.stdout.write(renderNextSteps(summary, args.output, lang));
   }
 
   if (args.ci) {
-    process.exit(summary.counts.critical > 0 ? 2 : summary.counts.warning > 0 ? 1 : 0);
+    // 2 = critical, 1 = warning, 3 = a check failed to run (incomplete), 0 = clean.
+    const cov = coverage(result.runs);
+    process.exit(
+      summary.counts.critical > 0 ? 2 : summary.counts.warning > 0 ? 1 : cov.failed > 0 ? 3 : 0,
+    );
   }
 }
 

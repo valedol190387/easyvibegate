@@ -67,6 +67,13 @@ const PATTERNS: Pattern[] = [
     fix: 'Revoke the token via BotFather and keep it server-side.',
   },
   {
+    id: 'supabase_secret_key',
+    title: 'Supabase secret key',
+    re: /\bsb_secret_[A-Za-z0-9_-]{10,}\b/g,
+    severity: 'critical',
+    fix: 'This is a Supabase secret key (full DB access). Remove it, rotate it in Supabase settings, and keep it server-side only.',
+  },
+  {
     id: 'private_key',
     title: 'Private key material',
     re: /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/g,
@@ -77,7 +84,16 @@ const PATTERNS: Pattern[] = [
 
 const GENERIC = /(?:api[_-]?key|secret|token|passwd|password|pwd|auth[_-]?token|access[_-]?token|client[_-]?secret)["']?\s*[:=]\s*["']([^"']{8,})["']/gi;
 
+// Unquoted env-style assignment (KEY=value), e.g. in .env / yaml / Dockerfile.
+const ENV_SECRET = /^\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE[_-]?KEY|API[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*\s*=\s*([^\s"'#]{8,})/gim;
+
 const JWT = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
+
+/** Env files hold secrets by design — the risk there is committing them, which
+ *  env-git flags. So a secret in an env file is a warning, not a source leak. */
+function isEnvFile(rel: string): boolean {
+  return rel === '.env' || /(^|\/)\.env(\.|$)/.test(rel) || /\.(ya?ml|toml|ini|conf)$/.test(rel) || /(^|\/)Dockerfile$/.test(rel) || rel.endsWith('docker-compose.yml') || rel.endsWith('docker-compose.yaml');
+}
 
 export const secretsChecker: Checker = {
   id: 'secrets',
@@ -88,15 +104,23 @@ export const secretsChecker: Checker = {
 
     for (const file of ctx.files) {
       const { content, rel } = file;
+      const env = isEnvFile(rel);
 
       for (const p of PATTERNS) {
         for (const m of content.matchAll(p.re)) {
+          // A secret in a server env/config file is expected — the risk is
+          // committing it (env-git flags that), so it is a warning, not a source leak.
+          const severity = env && p.severity === 'critical' ? 'warning' : p.severity;
           findings.push({
             id: p.id,
-            severity: p.severity,
-            title: p.title,
-            detail: `${p.title} found in source: ${redact(m[0])}`,
-            fix: p.fix,
+            severity,
+            title: env ? `${p.title} (in env/config file)` : p.title,
+            detail: env
+              ? `${p.title} in ${rel} (${redact(m[0])}). Normal for server env — keep this file gitignored and out of client bundles.`
+              : `${p.title} found in source: ${redact(m[0])}`,
+            fix: env
+              ? 'Keep this file out of git and out of client bundles; rotate the value if it may have been committed.'
+              : p.fix,
             checker: 'secrets',
             level: 0,
             file: rel,
@@ -112,10 +136,14 @@ export const secretsChecker: Checker = {
         if (payload && payload['role'] === 'service_role') {
           findings.push({
             id: 'supabase_service_role_key',
-            severity: 'critical',
-            title: 'Supabase service_role key in source',
-            detail: 'A service_role JWT bypasses Row Level Security entirely. It must never ship to the client or the repo.',
-            fix: 'Remove it, rotate the service_role key in Supabase settings, and use it only in trusted server code.',
+            severity: env ? 'warning' : 'critical',
+            title: env ? 'Supabase service_role key (in env/config file)' : 'Supabase service_role key in source',
+            detail: env
+              ? `A service_role JWT is in ${rel}. Fine for server env only — never commit it or ship it to the client; keep the file gitignored.`
+              : 'A service_role JWT bypasses Row Level Security entirely and is in source/client code. It must never ship to the client or the repo.',
+            fix: env
+              ? 'Keep it server-side only, ensure the file is gitignored, and rotate it if it may have been committed.'
+              : 'Remove it, rotate the service_role key in Supabase settings, and use it only in trusted server code.',
             checker: 'secrets',
             level: 0,
             file: rel,
@@ -125,18 +153,18 @@ export const secretsChecker: Checker = {
         }
       }
 
-      // Generic key/secret assignments, filtered by placeholder + entropy.
       if (rel.endsWith('.md') || rel.endsWith('.txt')) continue;
+
+      // Quoted key/secret assignments in code, filtered by placeholder + entropy.
       for (const m of content.matchAll(GENERIC)) {
         const value = m[1] ?? '';
-        if (looksLikePlaceholder(value)) continue;
-        if (shannonEntropy(value) < 3.2) continue;
+        if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.2) continue;
         findings.push({
           id: 'generic_secret',
           severity: 'warning',
           title: 'Possible hardcoded secret',
           detail: `A high-entropy value is assigned to a secret-looking name: ${redact(value)}`,
-          fix: 'If this is a real credential, move it to an env var and rotate it. If not, rename the variable or add `// easyvibegate-ignore`.',
+          fix: 'If this is a real credential, move it to a server-side env var and rotate it. If not, rename the variable or add `// easyvibegate-ignore`.',
           checker: 'secrets',
           level: 0,
           file: rel,
@@ -144,8 +172,38 @@ export const secretsChecker: Checker = {
           evidence: redact(value),
         });
       }
+
+      // Unquoted env-style assignments (e.g. .env / yaml / Dockerfile).
+      if (env) {
+        for (const m of content.matchAll(ENV_SECRET)) {
+          const value = m[1] ?? '';
+          if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
+          findings.push({
+            id: 'env_secret',
+            severity: 'warning',
+            title: 'Secret in env/config file',
+            detail: `A high-entropy value is assigned to a secret-looking name in ${rel}: ${redact(value)}`,
+            fix: 'Fine for server env — keep this file gitignored and out of the client; rotate if it may have leaked.',
+            checker: 'secrets',
+            level: 0,
+            file: rel,
+            line: lineAt(content, m.index ?? 0),
+            evidence: redact(value),
+          });
+        }
+      }
     }
 
-    return findings;
+    // De-duplicate multiple matches on the same file:line, keeping the most severe.
+    const rank: Record<Severity, number> = { critical: 0, warning: 1, info: 2, advisory: 3 };
+    const byLine = new Map<string, Finding>();
+    const passthrough: Finding[] = [];
+    for (const f of findings) {
+      if (f.file === undefined || f.line === undefined) { passthrough.push(f); continue; }
+      const key = `${f.file}:${f.line}`;
+      const cur = byLine.get(key);
+      if (!cur || rank[f.severity] < rank[cur.severity]) byLine.set(key, f);
+    }
+    return [...passthrough, ...byLine.values()];
   },
 };

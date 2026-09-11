@@ -1,5 +1,10 @@
-import type { Finding } from '../../types.js';
+import type { CheckRun, Finding } from '../../types.js';
 import { isErr, request, requestFollow } from '../../net/http.js';
+
+export interface LiveResult {
+  findings: Finding[];
+  run: CheckRun;
+}
 
 interface ExposedProbe {
   path: string;
@@ -36,7 +41,7 @@ function looksLikeHtml(body: string): boolean {
 }
 
 /** Passive live checks on a deployed URL: exposed files + security headers. */
-export async function checkLiveSite(appUrl: string): Promise<Finding[]> {
+export async function checkLiveSite(appUrl: string): Promise<LiveResult> {
   const base = appUrl.replace(/\/$/, '');
   const findings: Finding[] = [];
 
@@ -87,20 +92,37 @@ export async function checkLiveSite(appUrl: string): Promise<Finding[]> {
         endpoint: 'GET /',
       });
     }
-    const setCookie = root.headers.get('set-cookie');
-    if (setCookie && (!/httponly/i.test(setCookie) || !/secure/i.test(setCookie))) {
-      findings.push({
-        id: 'cookie_flags',
-        severity: 'warning',
-        title: 'Cookie missing Secure/HttpOnly',
-        detail: 'A cookie is set without both Secure and HttpOnly flags.',
-        fix: 'Set Secure and HttpOnly (and SameSite) on session cookies.',
-        checker: 'live-site',
-        level: 2,
-        endpoint: 'GET /',
-      });
+    // Inspect each Set-Cookie separately — one hardened cookie must not mask another.
+    const cookies = getSetCookies(root.headers);
+    for (const c of cookies) {
+      const name = c.split('=', 1)[0]?.trim() || 'cookie';
+      const secure = /;\s*secure/i.test(c);
+      const httpOnly = /;\s*httponly/i.test(c);
+      if (!secure || !httpOnly) {
+        const missing = [!secure ? 'Secure' : null, !httpOnly ? 'HttpOnly' : null].filter(Boolean).join(' + ');
+        findings.push({
+          id: 'cookie_flags',
+          severity: 'warning',
+          title: `Cookie "${name}" missing ${missing}`,
+          detail: `Set-Cookie for "${name}" is missing ${missing}. If it is a session/auth cookie, that weakens it against theft.`,
+          fix: 'Set Secure and HttpOnly (and SameSite) on session/auth cookies.',
+          checker: 'live-site',
+          level: 2,
+          endpoint: 'GET /',
+        });
+      }
     }
   }
 
-  return findings;
+  const status = isErr(root) ? 'failed' : 'completed';
+  const note = isErr(root) ? `could not reach ${base}/` : undefined;
+  return { findings, run: { id: 'live-site', level: 2, status, note } };
+}
+
+/** Get individual Set-Cookie header values (undici exposes getSetCookie()). */
+function getSetCookies(headers: Headers): string[] {
+  const withGetter = headers as Headers & { getSetCookie?: () => string[] };
+  if (typeof withGetter.getSetCookie === 'function') return withGetter.getSetCookie();
+  const single = headers.get('set-cookie');
+  return single ? [single] : [];
 }

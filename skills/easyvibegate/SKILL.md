@@ -34,8 +34,7 @@ Ask the user:
 - "What's the URL of the running app?" → pass `--url <appUrl>`.
 - "Confirm this is your own project?" → only then pass `--i-own-this`.
 Supabase/Firebase creds are auto-detected from the code; the probe reads with the
-public anon key. Keep it read-only unless the user explicitly asks to test writes
-(`--write`).
+public key. The probe is read-only (no writes).
 
 For the **IDOR test**, this is where you (the AI) add value the CLI cannot:
 1. Help the user obtain two test-account bearer tokens (walk them through logging
@@ -52,4 +51,4 @@ burned. For missing RLS, apply the generated SQL migration.
 ## Safety
 - Never run the live probe against a domain the user does not own.
 - Never print full secret values; report masked evidence only.
-- Writes are opt-in and use auto-cleaned canary rows.
+- The backend probe is read-only; it never writes to the database.

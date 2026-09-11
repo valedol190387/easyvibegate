@@ -1,7 +1,12 @@
-import type { Finding } from '../../types.js';
+import type { CheckRun, Finding } from '../../types.js';
 import type { Endpoint } from '../../endpoints.js';
 import { concretePath } from '../../endpoints.js';
 import { isErr, request, sleep } from '../../net/http.js';
+
+export interface IdorResult {
+  findings: Finding[];
+  run: CheckRun;
+}
 
 function bearer(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}`, accept: 'application/json' };
@@ -26,14 +31,23 @@ export async function idorDifferential(
   tokenA: string,
   tokenB: string,
   rateLimitMs = 120,
-): Promise<Finding[]> {
+): Promise<IdorResult> {
   const base = appUrl.replace(/\/$/, '');
   const findings: Finding[] = [];
 
   const idEndpoints = endpoints.filter(
-    (e) => (e.method === 'GET' || e.method === 'ANY') && /(:[A-Za-z0-9_]+|\[[^\]]+\])/.test(e.path),
+    (e) => (e.method === 'GET' || e.method === 'ANY') && /(:[A-Za-z0-9_]+|\[[^\]]+\]|\{[^}]+\})/.test(e.path),
   ).slice(0, 40);
 
+  if (idEndpoints.length === 0) {
+    return {
+      findings: [],
+      run: { id: 'idor', level: 2, status: 'skipped', note: 'no object-scoped (id) endpoints found' },
+    };
+  }
+
+  let probed = 0;
+  let usableResponses = 0;
   for (const e of idEndpoints) {
     const path = concretePath(e.path).replace(/^\/?/, '/');
     await sleep(rateLimitMs);
@@ -41,9 +55,11 @@ export async function idorDifferential(
     await sleep(rateLimitMs);
     const b = await request(base + path, { headers: bearer(tokenB) });
     if (isErr(a) || isErr(b)) continue;
+    probed++;
 
     const aOk = a.status === 200 && hasData(a.body);
     const bOk = b.status === 200 && hasData(b.body);
+    if (aOk || bOk) usableResponses++;
 
     if (aOk && bOk) {
       // Both users getting data on the same id is a *candidate* IDOR, but it is
@@ -66,17 +82,21 @@ export async function idorDifferential(
     }
   }
 
-  if (findings.length === 0) {
-    findings.push({
-      id: 'idor_clean',
-      severity: 'info',
-      title: 'IDOR differential found no shared objects',
-      detail: `Probed ${idEndpoints.length} object-scoped endpoint(s) with two accounts; none returned the same object to both.`,
-      fix: 'Keep verifying ownership on every object-scoped route.',
-      checker: 'idor',
-      level: 2,
-    });
+  // If the probes never produced a usable 200 (e.g. every id was a UUID and the
+  // guessed id=1 404'd), the run is inconclusive, not "clean".
+  if (probed === 0) {
+    return { findings, run: { id: 'idor', level: 2, status: 'failed', note: 'all requests errored' } };
   }
-
-  return findings;
+  if (usableResponses === 0) {
+    return {
+      findings,
+      run: {
+        id: 'idor',
+        level: 2,
+        status: 'partial',
+        note: 'no endpoint returned data for the guessed id — provide real object ids to confirm ownership',
+      },
+    };
+  }
+  return { findings, run: { id: 'idor', level: 2, status: 'completed' } };
 }

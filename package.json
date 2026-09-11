@@ -1,7 +1,7 @@
 {
   "name": "easyvibegate",
-  "version": "0.2.0",
-  "description": "Universal, interactive security scanner for vibe-coded apps. Proves the hole fires, not just guesses it.",
+  "version": "0.3.0",
+  "description": "Interactive security scanner for vibe-coded apps (focus: Next.js + Supabase). Checks common risks and shows evidence where it can.",
   "type": "module",
   "bin": {
     "easyvibegate": "dist/cli/index.js"
@@ -15,6 +15,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test": "node tests/run.mjs",
     "prepublishOnly": "pnpm build",
     "easyvibegate": "node dist/cli/index.js"
   },

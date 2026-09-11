@@ -3,6 +3,22 @@ export type Level = 0 | 1 | 2;
 
 export const SEVERITY_ORDER: Severity[] = ['critical', 'warning', 'info', 'advisory'];
 
+/**
+ * Whether a check actually ran and produced a trustworthy result. This is kept
+ * separate from findings so "checked and clean", "could not check", "nothing to
+ * check", and "not run" are never conflated into a green PASS.
+ */
+export type CheckStatus = 'completed' | 'partial' | 'failed' | 'skipped' | 'unsupported';
+
+export interface CheckRun {
+  /** Human id of the check, e.g. "static:secrets", "supabase-probe", "deps". */
+  id: string;
+  level: Level;
+  status: CheckStatus;
+  /** Short reason, shown to the user (e.g. "network error", "no lockfile"). */
+  note?: string;
+}
+
 export interface Finding {
   /** Machine-readable id, e.g. "openai_key", "supabase_anon_read". */
   id: string;

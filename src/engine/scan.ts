@@ -2,7 +2,7 @@ import { walk } from './walk.js';
 import { detect } from './detect.js';
 import { staticCheckers } from './checkers/index.js';
 import { applyIgnores, loadConfig } from './config.js';
-import type { Detection, Finding, ScanFile } from './types.js';
+import type { CheckRun, Detection, Finding, ScanFile } from './types.js';
 
 export interface ScanResult {
   root: string;
@@ -11,6 +11,8 @@ export interface ScanResult {
   fileCount: number;
   /** Files collected during the scan — reused by Level 1/2 for discovery. */
   files: ScanFile[];
+  /** Execution status of every check that was attempted. */
+  runs: CheckRun[];
 }
 
 export interface ScanOptions {
@@ -20,22 +22,22 @@ export interface ScanOptions {
 /** Run all Level 0 (static, read-only) checkers over a project directory. */
 export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<ScanResult> {
   const files = walk(root);
-  const detection = detect(files);
+  const detection = detect(root, files);
   const ctx = { root, files, detection };
 
   let findings: Finding[] = [];
+  const runs: CheckRun[] = [];
   for (const checker of staticCheckers) {
     try {
       findings.push(...(await checker.run(ctx)));
+      runs.push({ id: `static:${checker.id}`, level: 0, status: 'completed' });
     } catch (err) {
-      findings.push({
-        id: 'checker_error',
-        severity: 'info',
-        title: `Checker "${checker.id}" failed`,
-        detail: err instanceof Error ? err.message : String(err),
-        fix: 'Please report this at the EasyVibeGate repository.',
-        checker: checker.id,
-        level: checker.level,
+      // A broken checker is a failed check, not a clean pass.
+      runs.push({
+        id: `static:${checker.id}`,
+        level: 0,
+        status: 'failed',
+        note: err instanceof Error ? err.message : String(err),
       });
     }
   }
@@ -43,5 +45,5 @@ export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<
   const config = loadConfig(root, opts.configPath);
   findings = applyIgnores(findings, config, files);
 
-  return { root, detection, findings, fileCount: files.length, files };
+  return { root, detection, findings, fileCount: files.length, files, runs };
 }

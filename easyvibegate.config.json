@@ -1,0 +1,4 @@
+{
+  "ignore": [],
+  "ignorePaths": ["tests/", "docs/"]
+}

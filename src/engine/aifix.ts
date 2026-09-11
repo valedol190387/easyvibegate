@@ -27,6 +27,7 @@ export function buildAiFixPrompt(result: ScanResult, summary: Summary, lang: Lan
   lines.push(t(lang, 'aifix.rule3'));
   lines.push(t(lang, 'aifix.rule4'));
   lines.push(t(lang, 'aifix.rule5'));
+  lines.push(t(lang, 'aifix.rule6'));
   lines.push('');
   lines.push(`## ${t(lang, 'aifix.issues')}`);
   lines.push('');

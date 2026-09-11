@@ -109,7 +109,6 @@ export async function runWizard(args: WizardArgs): Promise<void> {
     configPath: args.config,
     appUrl,
     runDeps,
-    writeProbe: false,
     precomputedStatic: staticResult,
     consent,
     log,
@@ -117,7 +116,7 @@ export async function runWizard(args: WizardArgs): Promise<void> {
   const summary = summarize(result.findings);
 
   w(renderConsole(result, summary, lang));
-  w(renderVerdict(summary, lang));
+  w(renderVerdict(summary, result.runs, lang));
   w();
 
   mkdirSync(args.output, { recursive: true });

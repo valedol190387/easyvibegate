@@ -1,9 +1,13 @@
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Detection, ScanFile } from './types.js';
 
 /** Infer the project's frameworks, backends, languages and package managers. */
-export function detect(files: ScanFile[]): Detection {
+export function detect(root: string, files: ScanFile[]): Detection {
   const relSet = new Set(files.map((f) => f.rel));
-  const has = (p: string) => relSet.has(p);
+  // Lockfiles/markers are detected on disk directly — they are excluded from the
+  // content walk (binary or > size cap), but their presence still identifies the PM.
+  const has = (p: string) => relSet.has(p) || existsSync(join(root, p));
 
   const frameworks = new Set<string>();
   const backends = new Set<string>();
@@ -32,8 +36,12 @@ export function detect(files: ScanFile[]): Detection {
       const j = JSON.parse(pkg.content) as {
         dependencies?: Record<string, string>;
         devDependencies?: Record<string, string>;
+        packageManager?: string;
       };
       deps = { ...(j.dependencies ?? {}), ...(j.devDependencies ?? {}) };
+      // The `packageManager` field (Corepack) is authoritative when present.
+      const pmField = j.packageManager?.split('@')[0];
+      if (pmField === 'pnpm' || pmField === 'yarn' || pmField === 'npm' || pmField === 'bun') pms.add(pmField);
     } catch {
       /* ignore malformed package.json */
     }

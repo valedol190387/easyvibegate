@@ -13,6 +13,7 @@ const TEXT_EXT = new Set([
   '.py', '.rb', '.php', '.go', '.rs', '.java', '.kt', '.cs',
   '.html', '.css', '.scss', '.json', '.yml', '.yaml', '.toml',
   '.env', '.sh', '.sql', '.md', '.txt', '.ini', '.conf', '.tf',
+  '.pem', '.key', '.crt', '.cert', '.pkcs8',
 ]);
 
 const ALWAYS_NAMES = new Set(['Dockerfile', 'Gemfile', 'Procfile', 'Makefile', '.gitignore']);

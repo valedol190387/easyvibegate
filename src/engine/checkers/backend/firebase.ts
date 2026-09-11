@@ -1,5 +1,10 @@
-import type { Finding, ScanFile } from '../../types.js';
+import type { CheckRun, Finding, ScanFile } from '../../types.js';
 import { isErr, request, sleep } from '../../net/http.js';
+
+export interface FirebaseProbeResult {
+  findings: Finding[];
+  run: CheckRun;
+}
 
 export interface FirebaseCreds {
   projectId: string;
@@ -39,16 +44,19 @@ export interface FirebaseProbeOptions {
 }
 
 /** Probe Firebase RTDB, Firestore and Storage for anonymous read access. */
-export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Finding[]> {
+export async function probeFirebase(opts: FirebaseProbeOptions): Promise<FirebaseProbeResult> {
   const { creds } = opts;
   const rl = opts.rateLimitMs ?? 120;
   const log = opts.log ?? (() => {});
   const findings: Finding[] = [];
+  let attempts = 0;
+  let errors = 0;
 
   // 1. Realtime Database: the root .json endpoint.
   const rtdbBase = creds.databaseURL?.replace(/\/$/, '') ?? `https://${creds.projectId}-default-rtdb.firebaseio.com`;
   await sleep(rl);
   const rtdb = await request(`${rtdbBase}/.json?shallow=true`);
+  attempts++; if (isErr(rtdb)) errors++;
   if (!isErr(rtdb) && rtdb.status === 200 && rtdb.body.trim() !== 'null') {
     findings.push({
       id: 'firebase_rtdb_open',
@@ -69,6 +77,7 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Finding
     const res = await request(
       `https://firestore.googleapis.com/v1/projects/${creds.projectId}/databases/(default)/documents/${col}?pageSize=1`,
     );
+    attempts++; if (isErr(res)) errors++;
     if (!isErr(res) && res.status === 200 && /"documents"|"name"/.test(res.body)) {
       readable.push(col);
     }
@@ -90,6 +99,7 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Finding
   const bucket = creds.storageBucket ?? `${creds.projectId}.appspot.com`;
   await sleep(rl);
   const storage = await request(`https://firebasestorage.googleapis.com/v0/b/${bucket}/o`);
+  attempts++; if (isErr(storage)) errors++;
   if (!isErr(storage) && storage.status === 200 && /"items"|"prefixes"/.test(storage.body)) {
     findings.push({
       id: 'firebase_storage_open',
@@ -105,17 +115,7 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Finding
 
   log(`Firebase: probed RTDB, ${COMMON_COLLECTIONS.length} Firestore collections, storage bucket ${bucket}`);
 
-  if (findings.length === 0) {
-    findings.push({
-      id: 'firebase_probe_clean',
-      severity: 'info',
-      title: 'Firebase anon probe found no open data',
-      detail: 'RTDB root, common Firestore collections and the default bucket did not return data anonymously.',
-      fix: 'Keep Firebase rules requiring authentication and ownership.',
-      checker: 'firebase-probe',
-      level: 2,
-    });
-  }
-
-  return findings;
+  const status = errors === 0 ? 'completed' : errors < attempts ? 'partial' : 'failed';
+  const note = errors > 0 ? `${errors}/${attempts} requests errored` : undefined;
+  return { findings, run: { id: 'firebase-probe', level: 2, status, note } };
 }

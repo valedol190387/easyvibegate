@@ -1,8 +1,32 @@
-import type { Finding, Severity } from './types.js';
+import type { CheckRun, Finding, Severity } from './types.js';
 import { SEVERITY_ORDER } from './types.js';
 import type { ScanResult } from './scan.js';
 import { color } from './util/color.js';
 import { t, type Lang } from './i18n.js';
+
+export interface Coverage {
+  completed: number;
+  partial: number;
+  failed: number;
+  skipped: number;
+  unsupported: number;
+  total: number;
+  /** True if a check was attempted but could not finish (failed or partial). */
+  incomplete: boolean;
+  /** True if no check actually produced a trustworthy result. */
+  nothingVerified: boolean;
+}
+
+export function coverage(runs: CheckRun[]): Coverage {
+  const c = { completed: 0, partial: 0, failed: 0, skipped: 0, unsupported: 0 };
+  for (const r of runs) c[r.status]++;
+  return {
+    ...c,
+    total: runs.length,
+    incomplete: c.failed > 0 || c.partial > 0,
+    nothingVerified: c.completed + c.partial === 0,
+  };
+}
 
 const WEIGHTS: Record<Severity, number> = { critical: 25, warning: 8, info: 2, advisory: 0 };
 const EMOJI: Record<Severity, string> = { critical: '🔴', warning: '🟡', info: '🔵', advisory: '⚪' };
@@ -88,6 +112,9 @@ export function renderConsole(result: ScanResult, summary: Summary, lang: Lang =
   const c = summary.counts;
   lines.push(`  ${color.bold(t(lang, 'console.score'))} ${scoreColor(summary)} ${color.gray('/100')}   ${color.bold(t(lang, 'console.gate'))} ${gateText}`);
   lines.push(`  ${EMOJI.critical} ${c.critical}  ${EMOJI.warning} ${c.warning}  ${EMOJI.info} ${c.info}  ${EMOJI.advisory} ${c.advisory}`);
+  const cov = coverage(result.runs);
+  const covLine = t(lang, 'cov.line', { ok: cov.completed, failed: cov.failed, skipped: cov.skipped });
+  lines.push(`  ${cov.incomplete ? color.yellow(covLine) : color.gray(covLine)}`);
   lines.push('');
   return lines.join('\n');
 }
@@ -100,15 +127,21 @@ function scoreColor(summary: Summary): string {
 }
 
 /** One plain-language line a non-technical user understands. */
-export function renderVerdict(summary: Summary, lang: Lang = 'en'): string {
+export function renderVerdict(summary: Summary, runs: CheckRun[] = [], lang: Lang = 'en'): string {
   const c = summary.counts;
+  const cov = coverage(runs);
   if (summary.gate === 'fail') {
     return color.red(color.bold(`  ${t(lang, 'verdict.fail', { crit: c.critical })}`));
   }
-  if (c.warning > 0) {
-    return color.yellow(color.bold(`  ${t(lang, 'verdict.warn', { warn: c.warning })}`));
+  // No critical findings — but only call it clean if something was actually verified.
+  if (cov.nothingVerified && c.warning === 0) {
+    return color.yellow(color.bold(`  ${t(lang, 'verdict.nocov')}`));
   }
-  return color.green(color.bold(`  ${t(lang, 'verdict.clean')}`));
+  const caveat = cov.incomplete ? t(lang, 'verdict.incomplete') : '';
+  if (c.warning > 0) {
+    return color.yellow(color.bold(`  ${t(lang, 'verdict.warn', { warn: c.warning })}${caveat}`));
+  }
+  return color.green(color.bold(`  ${t(lang, 'verdict.clean')}${caveat}`));
 }
 
 /** The beginner-facing "what do I do now" block, with an AI-agent handoff. */
@@ -179,8 +212,10 @@ export function renderJson(result: ScanResult, summary: Summary): string {
       score: summary.score,
       gate: summary.gate,
       counts: summary.counts,
+      coverage: coverage(result.runs),
       fileCount: result.fileCount,
       detection: result.detection,
+      runs: result.runs,
       findings: sortFindings(result.findings),
     },
     null,

@@ -2,14 +2,30 @@
 
 ![license: MIT](https://img.shields.io/badge/license-MIT-brightgreen) ![node](https://img.shields.io/badge/node-%3E%3D18-blue) ![lang](https://img.shields.io/badge/lang-en%20%7C%20ru-informational)
 
-**Universal security scanner for vibe-coded apps. It doesn't just guess a hole exists — it proves the hole fires.**
+### 🇷🇺 Простыми словами
 
-Most scanners grep your code and say *"you might have leaked a key."* EasyVibeGate is built to go further:
-walk in with the anonymous key, read the data that should have been protected, and hand you back the
-exact `curl` that did it — plus the SQL to close it. Works on any stack.
+**Что это.** Проверка безопасности для приложений, собранных «на вайбе» с помощью ИИ (Cursor, Lovable, Bolt, Replit и т.п.). ИИ пишет код, который работает, но часто оставляет дыры: ключи прямо в коде, открытую всем базу данных, доступ к чужим данным. EasyVibeGate их находит и подсказывает, что чинить.
 
-> Status: **v0.2**. Static review, dependency audit, and the live Supabase/Firebase/endpoint probe
-> all work today.
+**Зачем.** Чтобы никто не скачал твою базу пользователей и не подделал данные через консоль браузера (F12).
+
+**Как пользоваться — 3 шага:**
+1. В папке своего проекта запусти одну команду.
+2. Ответь на пару вопросов «да / нет».
+3. Получишь понятный отчёт и готовый план починки — вставь его в свой ИИ (Cursor/Claude), и он всё исправит.
+
+Разбираться в том, что внутри, не нужно: сложное — под капотом, снаружи одна команда и вопросы «да / нет». Интерфейс по умолчанию русский; английский — флагом `--lang en`.
+
+---
+
+**A security scanner for vibe-coded apps. It checks common risks and shows evidence where it can get it.**
+
+Most scanners grep your code and say *"you might have leaked a key."* EasyVibeGate also goes to the
+running backend: for **Supabase/Firebase** it walks in with the public key and shows which tables are
+readable by anyone, with the exact `curl` — plus SQL to close it. It is honest about coverage: every
+check reports whether it actually ran, so a failed or skipped check is never shown as a green "all clear".
+
+> Status: **v0.3, early.** Best-supported stack: **Next.js + Supabase**. Code review runs on any stack;
+> the live backend probe is read-only and Supabase/Firebase-focused. Not a penetration test.
 
 ## Quick start (made for beginners)
 
@@ -24,9 +40,8 @@ wrong in plain language and hands you a ready-to-use fix plan. No install, no co
 assistant (Cursor, Claude Code, Windsurf…). For security fixes, pick a strong model like **Claude Fable**
 or Opus — not a small "fast" one.
 
-**Language / Язык:** the interface is English by default and Russian with `--lang ru`
-(auto-detected from your locale). Security findings themselves stay in technical English
-so they hand off cleanly to your AI agent.
+**Language / Язык:** the interface is **Russian by default**; use `--lang en` for English.
+Security findings themselves stay in technical English so they hand off cleanly to your AI agent.
 
 Power/CI usage skips the wizard:
 
@@ -52,10 +67,9 @@ easyvibegate . --help
 ### Level 1 — dependency audit
 Runs your package manager's audit (npm/pnpm/yarn) and summarizes known-vulnerable packages.
 
-### Level 2 — live probe (the point of the whole thing)
-Against your **running** app, with your confirmation (own apps only):
-- **Supabase / Firebase** — walk in with the public anon key and list which tables/buckets are readable (and, opt-in, writable) by anyone. Proves RLS is off instead of guessing.
-- **Any backend** — hit your endpoints with no login; with two test accounts (`--idor-tokens a,b`), diff responses to catch cross-user access (IDOR).
+### Level 2 — live probe (read-only, own apps only, with your confirmation)
+- **Supabase / Firebase** — walk in with the public key and list which tables/buckets are readable by anyone, with a reproducing `curl`. Table names that look sensitive (users, payments, …) are flagged critical; public-content tables are flagged as "confirm intent".
+- **Any backend, best-effort** — hit discovered endpoints with no login; with two test accounts (`--idor-tokens a,b`), diff responses to spot candidate cross-user access (IDOR). These are warnings to verify, not proof — the tool never writes.
 
 ## Scoring
 
