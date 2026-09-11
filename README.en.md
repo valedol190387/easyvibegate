@@ -12,7 +12,7 @@ Most scanners grep your code and say *"you might have leaked a key."* EasyVibeGa
 > Today, install straight from GitHub: `npx github:valedol190387/easyvibegate`
 > (it fetches the repo and builds itself).
 >
-> Status: **v0.3, early.** Best-supported stack: **Next.js + Supabase**. Code review runs on any stack; the live backend probe is read-only and Supabase/Firebase-focused. Not a penetration test.
+> Status: **v0.4, early.** Best-supported stack: **Next.js + Supabase**. Code review runs on any stack; the live backend probe is read-only and Supabase/Firebase-focused. Not a penetration test.
 
 ## How to run
 

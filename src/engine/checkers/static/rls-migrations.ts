@@ -98,25 +98,57 @@ interface Event {
 }
 
 /**
+ * Blank out only comments, preserving length and the `$$` delimiters that
+ * `maskSql` removes. Guard analysis needs the delimiters to find DO blocks, but
+ * must not read `-- end if` in a comment as a real block terminator.
+ */
+function maskSqlComments(sql: string): string {
+  const out = sql.split('');
+  const n = sql.length;
+  const blank = (from: number, to: number) => {
+    for (let k = from; k < to && k < n; k++) if (out[k] !== '\n') out[k] = ' ';
+  };
+  let i = 0;
+  while (i < n) {
+    if (sql[i] === '-' && sql[i + 1] === '-') { let j = i; while (j < n && sql[j] !== '\n') j++; blank(i, j); i = j; continue; }
+    if (sql[i] === '/' && sql[i + 1] === '*') { const c = sql.indexOf('*/', i + 2); const end = c === -1 ? n : c + 2; blank(i, end); i = end; continue; }
+    i++;
+  }
+  return out.join('');
+}
+
+/**
  * Spans inside a `DO $$ … $$` body that sit between an `IF … THEN` and its
  * `END IF`. DDL there runs only when the condition holds, and deciding that
  * needs an interpreter — so statements in these spans are reported as
  * "cannot be confirmed" rather than assumed to have run.
+ *
+ * IFs nest, so this matches them with a stack: taking the first `END IF` as the
+ * outer block's terminator ends the guard early and lets a statement after the
+ * inner `END IF` look unconditional. `ELSIF` is not an opener (`\bif\b` does not
+ * match inside it). Offsets are preserved, so they line up with `maskSql` output.
  */
 function conditionalRanges(sql: string): Array<[number, number]> {
+  const src = maskSqlComments(sql);
   const ranges: Array<[number, number]> = [];
-  for (const m of sql.matchAll(/\bdo\s*(\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$)/gi)) {
+  for (const m of src.matchAll(/\bdo\s*(\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$)/gi)) {
     const tag = m[1] as string;
     const bodyStart = (m.index ?? 0) + m[0].length;
-    const close = sql.indexOf(tag, bodyStart);
-    const bodyEnd = close === -1 ? sql.length : close;
-    const body = sql.slice(bodyStart, bodyEnd);
-    const lower = body.toLowerCase();
-    for (const im of body.matchAll(/\bif\b[\s\S]*?\bthen\b/gi)) {
-      const from = im.index ?? 0;
-      const endIdx = lower.indexOf('end if', from + im[0].length);
-      ranges.push([bodyStart + from, endIdx === -1 ? bodyEnd : bodyStart + endIdx]);
+    const close = src.indexOf(tag, bodyStart);
+    const bodyEnd = close === -1 ? src.length : close;
+    const body = src.slice(bodyStart, bodyEnd);
+    const open: number[] = [];
+    for (const t of body.matchAll(/\bend\s+if\b|\bif\b/gi)) {
+      const at = t.index ?? 0;
+      if (/^end/i.test(t[0])) {
+        const from = open.pop();
+        if (from !== undefined) ranges.push([bodyStart + from, bodyStart + at]);
+      } else {
+        open.push(at);
+      }
     }
+    // An IF left unterminated guards everything to the end of the block.
+    for (const from of open) ranges.push([bodyStart + from, bodyEnd]);
   }
   return ranges;
 }
@@ -170,20 +202,34 @@ export const rlsMigrationsChecker: Checker = {
     // True apply order: by migration file, then by statement position in the file.
     events.sort((a, b) => a.fileIdx - b.fileIdx || a.offset - b.offset);
 
-    interface State { created: boolean; enabled: boolean; file: string; line: number; display: string; stateFile: string; guardedEnable: boolean }
+    interface State { created: boolean; enabled: boolean; file: string; line: number; display: string; stateFile: string; guarded: boolean }
     const state = new Map<string, State>();
     for (const e of events) {
-      const cur = state.get(e.key) ?? { created: false, enabled: false, file: e.file, line: e.line, display: e.display, stateFile: e.file, guardedEnable: false };
+      const cur = state.get(e.key) ?? { created: false, enabled: false, file: e.file, line: e.line, display: e.display, stateFile: e.file, guarded: false };
+      // Doubt is a property of ANY guarded statement, not just a guarded ENABLE.
+      // A conditional DROP used to delete the table from the model outright, so
+      // a table left unprotected vanished from the report entirely. A later
+      // unconditional statement settles the state and clears the doubt.
+      if (e.conditional) {
+        // Keep the table in the model: assume the guarded branch did NOT run
+        // (the outcome that leaves data exposed), and record the uncertainty.
+        if (e.kind === 'create' && !cur.created) { cur.created = true; cur.enabled = false; cur.file = e.file; cur.line = e.line; cur.display = e.display; }
+        if (e.kind === 'enable') cur.enabled = true;
+        if (e.kind === 'disable') cur.enabled = false;
+        cur.guarded = true;
+        cur.stateFile = e.file;
+        state.set(e.key, cur);
+        continue;
+      }
       switch (e.kind) {
         case 'create':
           if (e.ifNotExists && cur.created) break; // existing table: no-op, keep RLS state
           cur.created = true; cur.enabled = false; cur.file = e.file; cur.line = e.line; cur.display = e.display;
-          cur.stateFile = e.file; cur.guardedEnable = false;
+          cur.stateFile = e.file; cur.guarded = false;
           break;
-        // A later unconditional ENABLE clears the doubt a guarded one left.
-        case 'enable': cur.enabled = true; cur.stateFile = e.file; cur.guardedEnable = e.conditional; break;
-        case 'disable': cur.enabled = false; cur.stateFile = e.file; cur.guardedEnable = false; break;
-        case 'drop': cur.created = false; cur.enabled = false; cur.stateFile = e.file; cur.guardedEnable = false; break;
+        case 'enable': cur.enabled = true; cur.stateFile = e.file; cur.guarded = false; break;
+        case 'disable': cur.enabled = false; cur.stateFile = e.file; cur.guarded = false; break;
+        case 'drop': cur.created = false; cur.enabled = false; cur.stateFile = e.file; cur.guarded = false; break;
       }
       state.set(e.key, cur);
     }
@@ -205,21 +251,26 @@ export const rlsMigrationsChecker: Checker = {
       const ambiguous = events.some(
         (e) => e.key === key && dirOf(e.file) !== dirOf(s.stateFile) && (s.enabled ? turnsOff(e.kind) : e.kind === 'enable'),
       );
-      if (s.enabled && !ambiguous && !s.guardedEnable) continue; // provably protected
-      const kind = ambiguous ? 'order' : s.enabled ? 'guarded' : 'missing';
+      if (s.enabled && !ambiguous && !s.guarded) continue; // provably protected
+      // `guarded` means a statement we had to GUESS about decided this table's
+      // state — a conditional ENABLE, DISABLE, CREATE or DROP. Calling that
+      // "critical" would be the same false confidence as calling it clean, so it
+      // is reported as unconfirmed. A warning still fails CI (exit 1); it just
+      // does not claim to know what only the database can tell.
+      const kind = ambiguous ? 'order' : s.guarded ? 'guarded' : 'missing';
       findings.push({
         id: 'rls_missing',
         severity: kind === 'missing' ? 'critical' : 'warning',
         title:
           kind === 'missing' ? `Table "${s.display}" created without RLS`
             : kind === 'order' ? `Table "${s.display}" may end up without RLS (migration order unclear)`
-              : `Table "${s.display}" enables RLS only inside a conditional block`,
+              : `Table "${s.display}" has an unconfirmed RLS state (conditional block)`,
         detail:
           kind === 'missing'
             ? `"${s.display}" is created in a migration and its latest state does not enable Row Level Security. If this table holds user data on Supabase, the anon key can read every row.`
             : kind === 'order'
               ? `"${s.display}" has statements in directories other than "${s.stateFile}" that contradict its final RLS state. Files in separate directories have no reliable apply order, so this cannot be decided statically — check the deployed state.`
-              : `"${s.display}" only gets ENABLE ROW LEVEL SECURITY inside an "IF … THEN" guard in a DO block. Whether that branch runs cannot be decided without executing the migration, so RLS is NOT confirmed — check the deployed state.`,
+              : `"${s.display}" has RLS statements inside an "IF … THEN" guard in a DO block. Whether that branch runs cannot be decided without executing the migration, so its RLS state is NOT confirmed — check the deployed state.`,
         fix: `ALTER TABLE ${s.display} ENABLE ROW LEVEL SECURITY; then add an owner/tenant policy, and drop any permissive "USING (true)" policy (policies are OR-ed). This is a static hint — confirm the deployed state.`,
         checker: 'rls-migrations',
         level: 0,

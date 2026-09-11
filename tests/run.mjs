@@ -887,6 +887,64 @@ await (async () => {
 
 
 
+// --- Regression: v0.4.3 audit — three more confident-PASS shapes -------------
+console.log('\nregressions (v0.4.3 audit)');
+
+await (async () => {
+  // IFs nest. Taking the FIRST "END IF" as the outer terminator ended the guard
+  // early, so a statement after the inner END IF looked unconditional.
+  const dir = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders (id serial);\nDO $$ BEGIN\n  IF false THEN\n    IF true THEN PERFORM 1; END IF;\n    ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n  END IF;\nEND $$;\n',
+  });
+  const r = await scanStatic(dir);
+  check('a nested IF does not end the outer guard early', () => {
+    const f = r.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `expected a finding, got ${ids(r)}`);
+    assert.strictEqual(f.severity, 'warning');
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // A comment must not terminate a guard.
+  const dir2 = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders (id serial);\nDO $$ BEGIN\n  IF false THEN\n    -- end if\n    ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n  END IF;\nEND $$;\n',
+  });
+  const r2 = await scanStatic(dir2);
+  check('"-- end if" in a comment does not close the guard', () => {
+    assert.ok(ids(r2).includes('rls_missing'), `got ${ids(r2)}`);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+
+  // A conditional DROP must not delete the table from the model.
+  const dir3 = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders (id serial);\nDO $$ BEGIN\n  IF false THEN DROP TABLE public.orders; END IF;\nEND $$;\n',
+  });
+  const r3 = await scanStatic(dir3);
+  check('a conditional DROP keeps the table, reported as unconfirmed not critical', () => {
+    const f = r3.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `table vanished from the analysis: got ${ids(r3)}`);
+    assert.strictEqual(f.severity, 'warning', 'a guessed DROP must not be claimed as critical');
+  });
+  rmSync(dir3, { recursive: true, force: true });
+
+  // Negative half: an UNCONDITIONAL drop really does remove the table.
+  const dir4 = fixture({ 'db/1.sql': 'CREATE TABLE public.orders (id serial);\nDROP TABLE public.orders;\n' });
+  const r4 = await scanStatic(dir4);
+  check('an unconditional DROP still removes the table from the report', () => {
+    assert.ok(!ids(r4).includes('rls_missing'), `got ${r4.findings.map((f) => f.title)}`);
+  });
+  rmSync(dir4, { recursive: true, force: true });
+
+  // Negative half: a guard that closes properly still lets later SQL be seen.
+  const dir5 = fixture({
+    'db/1.sql': 'CREATE TABLE public.orders (id serial);\nDO $$ BEGIN\n  IF true THEN PERFORM 1; END IF;\nEND $$;\nALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n',
+  });
+  const r5 = await scanStatic(dir5);
+  check('an unconditional ENABLE after a closed guard is still trusted', () => {
+    assert.ok(!ids(r5).includes('rls_missing'), `got ${r5.findings.map((f) => f.title)}`);
+  });
+  rmSync(dir5, { recursive: true, force: true });
+})();
+
 // --- Liveness: every static detector must still FIRE on its own target -------
 // Three detectors were once silently disabled by "fix the false positive"
 // changes while the suite stayed green, because those tests only asserted that
