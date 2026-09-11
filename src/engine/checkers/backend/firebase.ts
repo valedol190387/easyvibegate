@@ -1,5 +1,5 @@
 import type { CheckRun, Finding, ScanFile } from '../../types.js';
-import { isErr, request, sleep } from '../../net/http.js';
+import { isErr, request, sleep, unreliable } from '../../net/http.js';
 
 export interface FirebaseProbeResult {
   findings: Finding[];
@@ -56,7 +56,7 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Firebas
   const rtdbBase = creds.databaseURL?.replace(/\/$/, '') ?? `https://${creds.projectId}-default-rtdb.firebaseio.com`;
   await sleep(rl);
   const rtdb = await request(`${rtdbBase}/.json?shallow=true`);
-  attempts++; if (isErr(rtdb)) errors++;
+  attempts++; if (unreliable(rtdb)) errors++;
   if (!isErr(rtdb) && rtdb.status === 200 && rtdb.body.trim() !== 'null') {
     findings.push({
       id: 'firebase_rtdb_open',
@@ -77,7 +77,7 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Firebas
     const res = await request(
       `https://firestore.googleapis.com/v1/projects/${creds.projectId}/databases/(default)/documents/${col}?pageSize=1`,
     );
-    attempts++; if (isErr(res)) errors++;
+    attempts++; if (unreliable(res)) errors++;
     if (!isErr(res) && res.status === 200 && /"documents"|"name"/.test(res.body)) {
       readable.push(col);
     }
@@ -99,7 +99,7 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Firebas
   const bucket = creds.storageBucket ?? `${creds.projectId}.appspot.com`;
   await sleep(rl);
   const storage = await request(`https://firebasestorage.googleapis.com/v0/b/${bucket}/o`);
-  attempts++; if (isErr(storage)) errors++;
+  attempts++; if (unreliable(storage)) errors++;
   if (!isErr(storage) && storage.status === 200 && /"items"|"prefixes"/.test(storage.body)) {
     findings.push({
       id: 'firebase_storage_open',

@@ -84,15 +84,21 @@ const PATTERNS: Pattern[] = [
 
 const GENERIC = /(?:api[_-]?key|secret|token|passwd|password|pwd|auth[_-]?token|access[_-]?token|client[_-]?secret)["']?\s*[:=]\s*["']([^"']{8,})["']/gi;
 
-// Unquoted env-style assignment (KEY=value), e.g. in .env / yaml / Dockerfile.
-const ENV_SECRET = /^\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE[_-]?KEY|API[_-]?KEY|ACCESS[_-]?KEY)[A-Z0-9_]*\s*=\s*([^\s"'#]{8,})/gim;
-
 const JWT = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
 
-/** Env files hold secrets by design — the risk there is committing them, which
- *  env-git flags. So a secret in an env file is a warning, not a source leak. */
+// A KEY=value / key: value assignment whose NAME implies a secret.
+const ASSIGN = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*[:=][ \t]*(.+)$/gm;
+const SECRET_NAME = /(secret|token|password|passwd|private[_-]?key|api[_-]?key|access[_-]?key|credential)/i;
+
+/** Only .env* files are "server env by design" — a secret there is a warning
+ *  (env-git flags committing it). In real code/config it stays a source leak. */
 function isEnvFile(rel: string): boolean {
-  return rel === '.env' || /(^|\/)\.env(\.|$)/.test(rel) || /\.(ya?ml|toml|ini|conf)$/.test(rel) || /(^|\/)Dockerfile$/.test(rel) || rel.endsWith('docker-compose.yml') || rel.endsWith('docker-compose.yaml');
+  return rel === '.env' || /(^|\/)\.env(\.|$)/.test(rel);
+}
+
+/** Files where name=value secrets are worth scanning (env + common config). */
+function isConfigish(rel: string): boolean {
+  return isEnvFile(rel) || /\.(ya?ml|toml|ini|conf)$/.test(rel) || /(^|\/)Dockerfile$/.test(rel) || /docker-compose\.ya?ml$/.test(rel);
 }
 
 export const secretsChecker: Checker = {
@@ -173,17 +179,22 @@ export const secretsChecker: Checker = {
         });
       }
 
-      // Unquoted env-style assignments (e.g. .env / yaml / Dockerfile).
-      if (env) {
-        for (const m of content.matchAll(ENV_SECRET)) {
-          const value = m[1] ?? '';
-          if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
+      // name=value / key: value assignments with a secret-looking NAME (env + config).
+      // Parsing name and value separately catches bare `PASSWORD=...`.
+      if (isConfigish(rel)) {
+        for (const m of content.matchAll(ASSIGN)) {
+          const name = m[1] ?? '';
+          if (!SECRET_NAME.test(name)) continue;
+          const value = (m[2] ?? '').trim().replace(/^["']|["']$/g, '').replace(/["'].*$/, '');
+          if (value.length < 8 || looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
           findings.push({
             id: 'env_secret',
             severity: 'warning',
-            title: 'Secret in env/config file',
-            detail: `A high-entropy value is assigned to a secret-looking name in ${rel}: ${redact(value)}`,
-            fix: 'Fine for server env — keep this file gitignored and out of the client; rotate if it may have leaked.',
+            title: isEnvFile(rel) ? 'Secret in env file' : 'Secret in config file',
+            detail: `"${name}" holds a high-entropy value in ${rel}: ${redact(value)}`,
+            fix: isEnvFile(rel)
+              ? 'Fine for server env — keep this file gitignored and out of the client; rotate if it may have leaked.'
+              : 'Move this secret out of committed config into a server-side secret store, and rotate it.',
             checker: 'secrets',
             level: 0,
             file: rel,

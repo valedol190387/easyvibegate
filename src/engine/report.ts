@@ -145,11 +145,12 @@ export function renderVerdict(summary: Summary, runs: CheckRun[] = [], lang: Lan
 }
 
 /** The beginner-facing "what do I do now" block, with an AI-agent handoff. */
-export function renderNextSteps(summary: Summary, reportDir: string, lang: Lang = 'en'): string {
+export function renderNextSteps(summary: Summary, reportDir: string, runs: CheckRun[] = [], lang: Lang = 'en'): string {
+  const cov = coverage(runs);
   const lines: string[] = [];
   lines.push(color.bold(`  ${t(lang, 'next.title')}`));
   if (summary.counts.critical === 0 && summary.counts.warning === 0) {
-    lines.push(`  ${t(lang, 'next.clean')}`);
+    lines.push(`  ${cov.incomplete || cov.nothingVerified ? color.yellow(t(lang, 'next.incompleteClean')) : t(lang, 'next.clean')}`);
     lines.push('');
     return lines.join('\n');
   }
@@ -178,6 +179,15 @@ export function renderMarkdown(result: ScanResult, summary: Summary, lang: Lang 
   lines.push('');
   lines.push(badgeMarkdown(summary));
   lines.push('');
+
+  // Coverage — make failed/partial/skipped checks visible, never hidden behind findings.
+  const notDone = result.runs.filter((r) => r.status !== 'completed');
+  if (notDone.length > 0) {
+    lines.push(`## ${t(lang, 'md.checks')}`);
+    lines.push('');
+    for (const r of notDone) lines.push(`- \`${r.id}\` — **${r.status}**${r.note ? ` (${r.note})` : ''}`);
+    lines.push('');
+  }
 
   const shown = sortFindings(result.findings);
   if (shown.length === 0) {

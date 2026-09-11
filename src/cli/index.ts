@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { runFlow, type ConsentRequest } from '../orchestrator/flow.js';
@@ -18,7 +18,15 @@ import { runWizard } from './wizard.js';
 import { pickLang } from '../engine/i18n.js';
 import { color } from '../engine/util/color.js';
 
-const VERSION = '0.2.0';
+// Single source of truth for the version: package.json.
+function readVersion(): string {
+  try {
+    return JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version ?? '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+const VERSION = readVersion();
 
 type Format = 'all' | 'md' | 'json' | 'none';
 
@@ -40,6 +48,7 @@ interface Args {
   idorTokens?: [string, string];
   badIdorTokens: boolean;
   unknown: string[];
+  argErrors: string[];
   help: boolean;
   version: boolean;
 }
@@ -94,36 +103,54 @@ function parseArgs(argv: string[]): Args {
     wizard: false,
     badIdorTokens: false,
     unknown: [],
+    argErrors: [],
     help: false,
     version: false,
   };
   let sawPath = false;
+  let i = 0;
+  // Read a required value; error if it's missing or looks like another flag.
+  const need = (name: string): string | undefined => {
+    const v = argv[i + 1];
+    if (v === undefined || v.startsWith('-')) { a.argErrors.push(`${name} needs a value`); return undefined; }
+    i++;
+    return v;
+  };
 
-  for (let i = 0; i < argv.length; i++) {
+  for (; i < argv.length; i++) {
     const arg = argv[i]!;
     switch (arg) {
       case '-h': case '--help': a.help = true; break;
       case '-v': case '--version': a.version = true; break;
       case '--ci': a.ci = true; break;
-      case '-o': case '--output': a.output = argv[++i] ?? a.output; break;
+      case '-o': case '--output': a.output = need('--output') ?? a.output; break;
       case '-f': case '--format': {
-        const v = argv[++i];
+        const v = need('--format');
+        if (v === undefined) break;
         if (v === 'all' || v === 'md' || v === 'json' || v === 'none') a.format = v;
+        else a.argErrors.push(`--format must be one of all|md|json|none (got "${v}")`);
         break;
       }
       case '--no-report': a.format = 'none'; break;
-      case '-c': case '--config': a.config = argv[++i]; break;
-      case '--url': a.appUrl = argv[++i]; break;
-      case '--supabase-url': a.supabaseUrl = argv[++i]; break;
-      case '--supabase-key': a.supabaseKey = argv[++i]; break;
+      case '-c': case '--config': a.config = need('--config'); break;
+      case '--url': a.appUrl = need('--url'); break;
+      case '--supabase-url': a.supabaseUrl = need('--supabase-url'); break;
+      case '--supabase-key': a.supabaseKey = need('--supabase-key'); break;
       case '--i-own-this': a.iOwnThis = true; break;
       case '-y': case '--yes': a.yes = true; break;
       case '--deps': a.deps = true; break;
       case '--no-wizard': case '--scan': a.noWizard = true; break;
       case '--wizard': a.wizard = true; break;
-      case '--lang': a.lang = argv[++i]; break;
+      case '--lang': {
+        const v = need('--lang');
+        if (v === undefined) break;
+        if (v === 'ru' || v === 'en') a.lang = v;
+        else a.argErrors.push(`--lang must be ru or en (got "${v}")`);
+        break;
+      }
       case '--idor-tokens': {
-        const v = argv[++i] ?? '';
+        const v = need('--idor-tokens');
+        if (v === undefined) break;
         const parts = v.split(',').map((s) => s.trim()).filter(Boolean);
         if (parts.length === 2) a.idorTokens = [parts[0]!, parts[1]!];
         else a.badIdorTokens = true;
@@ -134,6 +161,12 @@ function parseArgs(argv: string[]): Args {
         else if (!sawPath) { a.path = arg; sawPath = true; }
     }
   }
+
+  // Cross-option validation.
+  const httpish = (u: string) => /^https?:\/\//i.test(u);
+  if (a.appUrl && !httpish(a.appUrl)) a.argErrors.push('--url must start with http:// or https://');
+  if (a.supabaseUrl && !httpish(a.supabaseUrl)) a.argErrors.push('--supabase-url must start with http:// or https://');
+  if (!!a.supabaseUrl !== !!a.supabaseKey) a.argErrors.push('--supabase-url and --supabase-key must be provided together');
   return a;
 }
 
@@ -154,6 +187,10 @@ async function main(): Promise<void> {
   }
   if (args.badIdorTokens) {
     process.stderr.write('easyvibegate: --idor-tokens needs exactly two comma-separated tokens (tokenA,tokenB).\n');
+    process.exit(2);
+  }
+  if (args.argErrors.length > 0) {
+    process.stderr.write(`easyvibegate: ${args.argErrors.join('; ')}\nRun with --help.\n`);
     process.exit(2);
   }
 
@@ -224,14 +261,15 @@ async function main(): Promise<void> {
 
   if (!args.ci) {
     process.stdout.write(renderVerdict(summary, result.runs, lang) + '\n\n');
-    if (args.format !== 'none') process.stdout.write(renderNextSteps(summary, args.output, lang));
+    if (args.format !== 'none') process.stdout.write(renderNextSteps(summary, args.output, result.runs, lang));
   }
 
   if (args.ci) {
-    // 2 = critical, 1 = warning, 3 = a check failed to run (incomplete), 0 = clean.
+    // 2 = critical, 1 = warning, 3 = a requested check could not complete, 0 = clean.
     const cov = coverage(result.runs);
+    const incomplete = cov.failed > 0 || cov.partial > 0 || cov.unsupported > 0;
     process.exit(
-      summary.counts.critical > 0 ? 2 : summary.counts.warning > 0 ? 1 : cov.failed > 0 ? 3 : 0,
+      summary.counts.critical > 0 ? 2 : summary.counts.warning > 0 ? 1 : incomplete ? 3 : 0,
     );
   }
 }

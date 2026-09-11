@@ -1,5 +1,5 @@
 import type { CheckRun, Finding } from '../../types.js';
-import { isErr, request, requestFollow } from '../../net/http.js';
+import { isErr, request, requestFollow, unreliable } from '../../net/http.js';
 
 export interface LiveResult {
   findings: Finding[];
@@ -63,8 +63,9 @@ export async function checkLiveSite(appUrl: string): Promise<LiveResult> {
   }
 
   // Follow redirects (bounded) so headers are read from the real page, not a 301/302 hop.
+  // Only analyze headers on a reliable response — a 5xx/429 must not masquerade as "headers missing".
   const root = await requestFollow(base + '/');
-  if (!isErr(root)) {
+  if (!isErr(root) && root.status !== 429 && root.status < 500) {
     for (const h of SECURITY_HEADERS) {
       if (!root.headers.get(h.header)) {
         findings.push({
@@ -114,8 +115,10 @@ export async function checkLiveSite(appUrl: string): Promise<LiveResult> {
     }
   }
 
-  const status = isErr(root) ? 'failed' : 'completed';
-  const note = isErr(root) ? `could not reach ${base}/` : undefined;
+  const status = unreliable(root) ? 'failed' : 'completed';
+  const note = unreliable(root)
+    ? isErr(root) ? `could not reach ${base}/` : `unreliable response (HTTP ${root.status}) from ${base}/`
+    : undefined;
   return { findings, run: { id: 'live-site', level: 2, status, note } };
 }
 

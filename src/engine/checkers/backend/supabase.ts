@@ -1,6 +1,6 @@
 import type { CheckRun, Finding, ScanFile, Severity } from '../../types.js';
 import { decodeJwtPayload } from '../../util/text.js';
-import { isErr, request, sleep } from '../../net/http.js';
+import { isErr, request, sleep, unreliable } from '../../net/http.js';
 
 export interface SupabaseCreds {
   url: string;
@@ -134,21 +134,21 @@ export async function probeSupabase(opts: ProbeOptions): Promise<ProbeResult> {
   const log = opts.log ?? (() => {});
   const findings: Finding[] = [];
 
-  // Refuse to probe with a service/secret key — the result would be meaningless
-  // (it bypasses RLS) and it is a dangerous credential to send around.
+  // Only a genuine public key proves anything about anonymous access. Reject
+  // service/secret keys (bypass RLS) AND authenticated/unknown keys (not anon).
   const kind = classifyKey(creds.anonKey);
-  if (kind === 'jwt-service' || kind === 'secret') {
+  if (kind !== 'jwt-anon' && kind !== 'publishable') {
     return {
       findings: [{
         id: 'supabase_key_not_public',
         severity: 'warning',
-        title: 'Supabase probe skipped — key is a service/secret key',
-        detail: 'The provided key is a service_role/secret key. Probing with it bypasses RLS and proves nothing about anonymous access.',
-        fix: 'Re-run with the public anon (or publishable) key. Keep the service/secret key server-side only.',
+        title: 'Supabase probe skipped — key is not a public anon key',
+        detail: `The provided key is "${kind}". Only a public anon (or publishable) key proves anything about anonymous access; probing with anything else is meaningless or unsafe.`,
+        fix: 'Re-run with the public anon (or publishable) key. Keep service/secret keys server-side only.',
         checker: 'supabase-probe',
         level: 2,
       }],
-      run: { id: 'supabase-probe', level: 2, status: 'skipped', note: 'non-public key provided' },
+      run: { id: 'supabase-probe', level: 2, status: 'skipped', note: `non-anon key (${kind})` },
     };
   }
 
@@ -171,7 +171,7 @@ export async function probeSupabase(opts: ProbeOptions): Promise<ProbeResult> {
       method: 'HEAD',
       headers: { ...authHeaders(creds.anonKey), Prefer: 'count=exact', Range: '0-0', 'Range-Unit': 'items' },
     });
-    if (isErr(res)) { errored++; continue; }
+    if (isErr(res) || res.status === 429 || res.status >= 500) { errored++; continue; }
     if (res.status === 200 || res.status === 206) {
       const count = parseCount(res.headers);
       if (count === null || count > 0) {
@@ -198,6 +198,7 @@ export async function probeSupabase(opts: ProbeOptions): Promise<ProbeResult> {
   // Storage buckets listable by anon.
   await sleep(rl);
   const buckets = await request(`${creds.url}/storage/v1/bucket`, { headers: authHeaders(creds.anonKey) });
+  const storageErrored = unreliable(buckets);
   if (!isErr(buckets) && buckets.status === 200) {
     try {
       const list = JSON.parse(buckets.body) as Array<{ name?: string; public?: boolean }>;
@@ -229,7 +230,9 @@ export async function probeSupabase(opts: ProbeOptions): Promise<ProbeResult> {
     });
   }
 
-  const status = errored === 0 ? 'completed' : errored < tables.length ? 'partial' : 'failed';
-  const note = errored > 0 ? `${errored}/${tables.length} table probes errored` : undefined;
+  const attempted = tables.length + 1; // tables + storage
+  const totalErr = errored + (storageErrored ? 1 : 0);
+  const status = totalErr === 0 ? 'completed' : totalErr < attempted ? 'partial' : 'failed';
+  const note = totalErr > 0 ? `${totalErr}/${attempted} probe requests errored (5xx/429/timeout)` : undefined;
   return { findings, run: { id: 'supabase-probe', level: 2, status, note } };
 }

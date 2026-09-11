@@ -124,7 +124,7 @@ export async function runWizard(args: WizardArgs): Promise<void> {
   writeFileSync(join(args.output, 'report.json'), renderJson(result, summary), 'utf8');
   writeFileSync(join(args.output, 'ai-fix-prompt.md'), buildAiFixPrompt(result, summary, lang), 'utf8');
 
-  w(renderNextSteps(summary, args.output, lang));
+  w(renderNextSteps(summary, args.output, result.runs, lang));
   w(color.gray(`  ${t(lang, 'next.fullReport', { path: `${args.output}/report.md` })}`));
   if (summary.counts.critical > 0 || summary.counts.warning > 0) {
     w(color.gray(`  ${t(lang, 'next.badge', { badge: badgeMarkdown(summary) })}`));

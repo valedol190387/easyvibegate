@@ -1,7 +1,7 @@
 import type { CheckRun, Finding } from '../../types.js';
 import type { Endpoint } from '../../endpoints.js';
 import { concretePath } from '../../endpoints.js';
-import { isErr, request, sleep } from '../../net/http.js';
+import { isErr, request, sleep, unreliable } from '../../net/http.js';
 
 export interface EndpointProbeResult {
   findings: Finding[];
@@ -38,7 +38,7 @@ export async function probeEndpointsUnauth(
     await sleep(rateLimitMs);
     const path = concretePath(e.path).replace(/^\/?/, '/');
     const res = await request(base + path, { headers: { accept: 'application/json' } });
-    if (isErr(res)) { errors++; continue; }
+    if (isErr(res) || res.status === 429 || res.status >= 500) { errors++; continue; }
     if (res.status !== 200) continue;
     if (!looksLikeData(res.body)) continue;
 

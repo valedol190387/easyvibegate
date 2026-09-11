@@ -50,6 +50,17 @@ export function buildAiFixPrompt(result: ScanResult, summary: Summary, lang: Lan
     lines.push('');
   }
 
+  // Checks that did not complete — the AI must not read a failed check as "clean".
+  const notDone = result.runs.filter((r) => r.status === 'failed' || r.status === 'partial' || r.status === 'unsupported');
+  if (notDone.length > 0) {
+    lines.push(`## ${t(lang, 'aifix.incomplete')}`);
+    lines.push('');
+    for (const r of notDone) lines.push(`- \`${r.id}\` — ${r.status}${r.note ? ` (${r.note})` : ''}`);
+    lines.push('');
+    lines.push(t(lang, 'aifix.incompleteTask'));
+    lines.push('');
+  }
+
   lines.push(`## ${t(lang, 'aifix.done')}`);
   lines.push(t(lang, 'aifix.done1'));
   lines.push(t(lang, 'aifix.done2'));

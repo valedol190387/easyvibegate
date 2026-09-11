@@ -84,5 +84,55 @@ check('endpoints: pages index + FastAPI {id} handled', () => {
   assert.ok(legacy && legacy.method === 'ANY', 'Flask @route should normalize to ANY');
 });
 
+await (async () => {
+  const dir = fixture({ 'db/001.sql': 'CREATE TABLE public.orders (id uuid);\nCREATE TABLE internal.orders (id uuid);\nALTER TABLE internal.orders ENABLE ROW LEVEL SECURITY;\n' });
+  const r = await scanStatic(dir);
+  check('RLS: schema-qualified names are not confused', () => {
+    const rls = r.findings.filter((f) => f.id === 'rls_missing').map((f) => f.title);
+    assert.ok(rls.some((t) => t.includes('public.orders')), 'public.orders must be flagged');
+    assert.ok(!rls.some((t) => t.includes('internal.orders')), 'internal.orders is enabled, must not be flagged');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'db/001.sql': 'CREATE TABLE public.t (id uuid);\nALTER TABLE public.t ENABLE ROW LEVEL SECURITY;\nALTER TABLE public.t DISABLE ROW LEVEL SECURITY;\n' });
+  const r = await scanStatic(dir);
+  check('RLS: DISABLE after ENABLE is flagged', () => {
+    assert.ok(r.findings.some((f) => f.id === 'rls_missing'), 'a table disabled again should be flagged');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'db/001.sql': 'CREATE TABLE "public"."orders" (id uuid);\nALTER TABLE "public"."orders" ENABLE ROW LEVEL SECURITY;\n' });
+  const r = await scanStatic(dir);
+  check('RLS: quoted identifiers parse correctly (no bogus "public" table)', () => {
+    const rls = r.findings.filter((f) => f.id === 'rls_missing');
+    assert.strictEqual(rls.length, 0, `quoted+enabled table should be clean, got: ${rls.map((f) => f.title).join(', ')}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ '.env': 'PASSWORD=G7m2Q9v4R8c5N1p6Xk\n' });
+  const r = await scanStatic(dir);
+  check('secrets: bare PASSWORD= in .env is caught', () => {
+    assert.ok(r.findings.some((f) => f.id === 'env_secret'), 'bare PASSWORD= should be flagged');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'config.yml': 'openai: sk-proj-abc123DEF456ghi789JKL012mno345PQR\n' });
+  const r = await scanStatic(dir);
+  check('secrets: vendor key in config.yml stays critical (not downgraded)', () => {
+    const k = r.findings.find((f) => f.id === 'openai_key');
+    assert.ok(k, 'openai key in yaml should be found');
+    assert.strictEqual(k.severity, 'critical');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

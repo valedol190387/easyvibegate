@@ -13,6 +13,11 @@ export function isErr(r: HttpResult): r is HttpErr {
   return 'error' in r;
 }
 
+/** A transport error, a 429, or a 5xx — the response can't be trusted as a real result. */
+export function unreliable(r: HttpResult): boolean {
+  return isErr(r) || r.status === 429 || r.status >= 500;
+}
+
 // Cap the response body we buffer so a huge/hostile response can't blow up memory.
 const MAX_BODY_BYTES = 2 * 1024 * 1024; // 2 MB
 
