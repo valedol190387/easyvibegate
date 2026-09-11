@@ -1,6 +1,6 @@
 # 🛡 EasyVibeGate
 
-![license: MIT](https://img.shields.io/badge/license-MIT-brightgreen) ![node](https://img.shields.io/badge/node-%3E%3D18-blue) ![lang](https://img.shields.io/badge/lang-ru%20%7C%20en-informational)
+![npm](https://img.shields.io/npm/v/easyvibegate) ![license: MIT](https://img.shields.io/badge/license-MIT-brightgreen) ![node](https://img.shields.io/badge/node-%3E%3D18-blue) ![lang](https://img.shields.io/badge/lang-ru%20%7C%20en-informational)
 
 🇷🇺 Русская версия: [README.md](README.md)
 
@@ -8,10 +8,6 @@
 
 Most scanners grep your code and say *"you might have leaked a key."* EasyVibeGate also goes to the running backend: for **Supabase/Firebase** it walks in with the public key and shows which tables are readable by anyone, with the exact `curl` — plus SQL to close it. It is honest about coverage: every check reports whether it actually ran, so a failed or skipped check is never shown as a green "all clear".
 
-> ⚠️ **Not published to npm yet** — `npx easyvibegate` will work after publishing.
-> Today, install straight from GitHub: `npx github:valedol190387/easyvibegate`
-> (it fetches the repo and builds itself).
->
 > Status: **v0.4, early.** Best-supported stack: **Next.js + Supabase**. Code review runs on any stack; the live backend probe is read-only and Supabase/Firebase-focused. Not a penetration test.
 
 ## How to run
@@ -25,7 +21,7 @@ If you use **Cursor, Claude Code, or Codex**, you don't need to type anything in
 ```
 Check this project's security with EasyVibeGate and explain the result in plain language.
 
-1. Run at the project root:  npx github:valedol190387/easyvibegate . --no-wizard --deps
+1. Run at the project root:  npx easyvibegate . --no-wizard --deps
    (After the npm release the short form is: npx easyvibegate . --no-wizard --deps)
    (Add  --url <my-app-url> --i-own-this  only if this is my project
     and I allow the live backend probe.)
@@ -39,7 +35,7 @@ The agent runs it, reads the report, and explains the findings. You can also jus
 ### Option 2. One command in the terminal
 
 ```bash
-npx github:valedol190387/easyvibegate
+npx easyvibegate
 ```
 
 Run it inside your project. (After the npm release: `npx easyvibegate`.) A friendly wizard asks a few plain yes/no questions, tells you what's wrong in plain language, and writes a ready-to-use fix plan. No install, no config, no runtime deps.
@@ -58,7 +54,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
-      - run: npx github:valedol190387/easyvibegate . --ci
+      - run: npx easyvibegate . --ci
 ```
 
 Exit codes: `2` = critical, `1` = warnings, `3` = a check failed to run, `0` = clean.

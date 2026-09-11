@@ -1,6 +1,6 @@
 # 🛡 EasyVibeGate
 
-![license: MIT](https://img.shields.io/badge/license-MIT-brightgreen) ![node](https://img.shields.io/badge/node-%3E%3D18-blue) ![lang](https://img.shields.io/badge/lang-ru%20%7C%20en-informational)
+![npm](https://img.shields.io/npm/v/easyvibegate) ![license: MIT](https://img.shields.io/badge/license-MIT-brightgreen) ![node](https://img.shields.io/badge/node-%3E%3D18-blue) ![lang](https://img.shields.io/badge/lang-ru%20%7C%20en-informational)
 
 🇬🇧 English version: [README.en.md](README.en.md)
 
@@ -8,10 +8,6 @@
 
 Большинство сканеров просто грепают код и говорят «возможно, ты слил ключ». EasyVibeGate идёт дальше: для **Supabase/Firebase** заходит публичным ключом и показывает, какие таблицы читаются кем угодно, с готовым `curl` и SQL для починки. И он честен про покрытие: каждая проверка сообщает, реально ли она выполнилась, поэтому упавшая или пропущенная проверка **никогда не выдаётся за зелёное «всё чисто»**.
 
-> ⚠️ **Пакет ещё не опубликован в npm.** Команда `npx easyvibegate` заработает после публикации.
-> Сейчас рабочий способ — установка прямо из GitHub: `npx github:valedol190387/easyvibegate`
-> (скачает репозиторий и соберёт его сам).
->
 > Статус: **v0.4, ранняя версия.** Лучше всего поддержан стек **Next.js + Supabase**. Осмотр кода работает на любом стеке; живой пробинг бэкенда — только чтение и заточен под Supabase/Firebase. Это не пентест.
 
 ## 🇷🇺 Простыми словами
@@ -38,8 +34,7 @@
 ```
 Проверь безопасность этого проекта с помощью EasyVibeGate и объясни результат простыми словами.
 
-1. Запусти в корне проекта:  npx github:valedol190387/easyvibegate . --no-wizard --deps
-   (После публикации в npm короткая форма: npx easyvibegate . --no-wizard --deps)
+1. Запусти в корне проекта:  npx easyvibegate . --no-wizard --deps
    (Добавь  --url <адрес-моего-приложения> --i-own-this  только если это мой проект
     и я разрешаю живую проверку бэкенда.)
 2. Открой и изучи файл:  easyvibegate-report/ai-fix-prompt.md
@@ -52,10 +47,10 @@
 ### Способ 2. Одной командой в терминале
 
 ```bash
-npx github:valedol190387/easyvibegate
+npx easyvibegate
 ```
 
-Запусти внутри своего проекта. (После публикации в npm будет короче: `npx easyvibegate`.) Дружелюбный мастер задаст пару вопросов «да/нет», понятным языком расскажет, что не так, и создаст готовый план починки. Ни установки, ни настройки, ни зависимостей.
+Запусти внутри своего проекта. Дружелюбный мастер задаст пару вопросов «да/нет», понятным языком расскажет, что не так, и создаст готовый план починки. Ни установки, ни настройки, ни зависимостей.
 
 ### Способ 3. В CI (GitHub Actions)
 
@@ -71,7 +66,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
-      - run: npx github:valedol190387/easyvibegate . --ci
+      - run: npx easyvibegate . --ci
 ```
 
 Коды выхода: `2` — есть критичное, `1` — предупреждения, `3` — проверка не завершилась, `0` — чисто.

@@ -91,7 +91,7 @@ const EN: Dict = {
   'aifix.done': 'When done',
   'aifix.done1': '- List which secrets I must rotate myself.',
   'aifix.done2': '- List any migration I must run and where.',
-  'aifix.done3': '- Summarize what is fixed and what still needs a live re-scan (`npx github:valedol190387/easyvibegate . --url <app> --i-own-this`).',
+  'aifix.done3': '- Summarize what is fixed and what still needs a live re-scan (`npx easyvibegate . --url <app> --i-own-this`).',
 };
 
 const RU: Dict = {
@@ -177,7 +177,7 @@ const RU: Dict = {
   'aifix.done': 'Когда закончишь',
   'aifix.done1': '- Перечисли, какие секреты я должен сменить сам.',
   'aifix.done2': '- Перечисли, какие миграции нужно прогнать и где.',
-  'aifix.done3': '- Подведи итог: что починено и что ещё требует живой перепроверки (`npx github:valedol190387/easyvibegate . --url <app> --i-own-this`).',
+  'aifix.done3': '- Подведи итог: что починено и что ещё требует живой перепроверки (`npx easyvibegate . --url <app> --i-own-this`).',
 };
 
 const TABLES: Record<Lang, Dict> = { en: EN, ru: RU };

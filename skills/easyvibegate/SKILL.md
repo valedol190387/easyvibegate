@@ -15,14 +15,14 @@ You drive EasyVibeGate as a conversation. Explain each level before running it, 
 never probe a live system without the user confirming they own it.
 
 ## 0. Install / locate
-- Run `npx github:valedol190387/easyvibegate` (works today; the package is not on npm yet).
+- Run `npx easyvibegate` (no install needed).
 - If a local checkout is built, `node dist/cli/index.js` also works.
 - Otherwise run from source: `pnpm install && pnpm build` inside the easyvibegate repo.
 
 ## 1. Level 0 — code review (always safe, no consent needed)
 Run:
 ```
-npx github:valedol190387/easyvibegate <project-path>
+npx easyvibegate <project-path>
 ```
 Summarize the findings in plain language, most severe first. Point out the
 critical ones (leaked service_role keys, missing RLS, secrets in the client).
