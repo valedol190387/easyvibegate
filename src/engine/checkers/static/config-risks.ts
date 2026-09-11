@@ -1,5 +1,6 @@
 import type { Checker, Finding, Severity } from '../../types.js';
 import { lineAt } from '../../util/text.js';
+import { looksMinified, maskCode } from '../../util/mask.js';
 
 interface Rule {
   id: string;
@@ -8,8 +9,6 @@ interface Rule {
   severity: Severity;
   detail: string;
   fix: string;
-  /** Skip prose files where matches are almost always examples. */
-  skipDocs?: boolean;
 }
 
 const RULES: Rule[] = [
@@ -36,7 +35,6 @@ const RULES: Rule[] = [
     severity: 'warning',
     detail: 'eval on any untrusted input is a code-execution risk.',
     fix: 'Replace eval with explicit parsing/logic; never eval user-supplied data.',
-    skipDocs: true,
   },
   {
     id: 'sql_interpolation',
@@ -45,11 +43,10 @@ const RULES: Rule[] = [
     // inside one string literal — so prose mentioning "insert" won't match.
     // Quantifiers are length-bounded ({0,200}) to prevent catastrophic
     // backtracking (ReDoS) on very long / minified lines.
-    re: /`[^`]{0,200}\b(?:SELECT|INSERT|UPDATE|DELETE)\b[^`]{0,200}\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b[^`]{0,200}\$\{|f["'][^"'\n]{0,200}\b(?:SELECT|INSERT|UPDATE|DELETE)\b[^"'\n]{0,200}\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b[^"'\n]{0,200}\{/gi,
+    re: /`\s*(?:SELECT|INSERT|UPDATE|DELETE)\b[^`]{0,200}\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b[^`]{0,200}\$\{|f["']\s*(?:SELECT|INSERT|UPDATE|DELETE)\b[^"'\n]{0,200}\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b[^"'\n]{0,200}\{/gi,
     severity: 'warning',
     detail: 'Interpolating values into SQL invites SQL injection.',
     fix: 'Use parameterized queries / prepared statements instead of string interpolation.',
-    skipDocs: true,
   },
   {
     id: 'jwt_alg_none',
@@ -71,8 +68,12 @@ export const configRisksChecker: Checker = {
     for (const file of ctx.files) {
       // Config risks in prose docs are examples, not live config — skip them.
       if (file.rel.endsWith('.md') || file.rel.endsWith('.txt')) continue;
+      if (looksMinified(file.rel, file.content)) continue; // generated output, not source
+      // Comments and quoted strings must not trigger rules; backticks stay so the
+      // SQL-interpolation rule can still see template literals.
+      const scan = maskCode(file.content, { strings: true });
       for (const rule of RULES) {
-        for (const m of file.content.matchAll(rule.re)) {
+        for (const m of scan.matchAll(rule.re)) {
           findings.push({
             id: rule.id,
             severity: rule.severity,

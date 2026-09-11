@@ -6,8 +6,13 @@ export interface Endpoint {
   where: string;
 }
 
-const JS_ROUTE = /\b(?:app|router|fastify|server)\.(get|post|put|patch|delete|all)\s*\(\s*["'`]([^"'`]+)["'`]/gi;
+// Any receiver: app/router/api/server/v1/`this.x` … .get('/path')
+const JS_ROUTE = /[\w$)\]]\s*\.(get|post|put|patch|delete|all|options|head)\s*\(\s*["'`](\/[^"'`]*)["'`]/gi;
 const PY_ROUTE = /@\w+\.(get|post|put|patch|delete|route)\s*\(\s*["']([^"']+)["']/gi;
+// NestJS: @Get('users') on a controller method.
+const NEST_ROUTE = /@(Get|Post|Put|Patch|Delete|All)\s*\(\s*["'`]([^"'`]*)["'`]?\s*\)/g;
+// Django: path('users/', ...) / re_path(r'^users/$', ...)
+const DJANGO_ROUTE = /\b(?:re_)?path\s*\(\s*r?["']([^"']+)["']/gi;
 
 function normalizeMethod(m: string): string {
   const up = m.toUpperCase();
@@ -23,6 +28,8 @@ export function collectEndpoints(files: Pick<ScanFile, 'rel' | 'content'>[]): En
   const seen = new Set<string>();
   const add = (method: string, path: string, where: string) => {
     if (!path) return;
+    // A path built from variables cannot be probed — reporting it is noise.
+    if (path.includes('${') || path.includes('" +') || path.includes("' +")) return;
     const key = `${method} ${path}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -44,6 +51,10 @@ export function collectEndpoints(files: Pick<ScanFile, 'rel' | 'content'>[]): En
     }
     for (const m of f.content.matchAll(JS_ROUTE)) add(normalizeMethod(m[1] ?? 'any'), m[2] ?? '', f.rel);
     for (const m of f.content.matchAll(PY_ROUTE)) add(normalizeMethod(m[1] ?? 'any'), m[2] ?? '', f.rel);
+    for (const m of f.content.matchAll(NEST_ROUTE)) add(normalizeMethod(m[1] ?? 'any'), '/' + (m[2] ?? '').replace(/^\//, ''), f.rel);
+    if (/(^|\/)urls?\.py$/.test(f.rel) || /urlpatterns/.test(f.content)) {
+      for (const m of f.content.matchAll(DJANGO_ROUTE)) add('ANY', '/' + (m[1] ?? '').replace(/^\^/, '').replace(/^\//, '').replace(/\$$/, ''), f.rel);
+    }
   }
 
   return out;

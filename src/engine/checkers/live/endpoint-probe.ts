@@ -8,11 +8,20 @@ export interface EndpointProbeResult {
   run: CheckRun;
 }
 
+/** Real, non-empty JSON payload — `[]`, `{}` and `{"error":...}` are not data. */
 function looksLikeData(body: string): boolean {
   const t = body.trim();
-  if (t.length < 2) return false;
-  if (/<!doctype html|<html[\s>]/i.test(t.slice(0, 200))) return false;
-  return t.startsWith('{') || t.startsWith('[');
+  if (t.length < 2 || !(t.startsWith('{') || t.startsWith('['))) return false;
+  try {
+    const v = JSON.parse(t) as unknown;
+    if (Array.isArray(v)) return v.length > 0;
+    if (v && typeof v === 'object') {
+      const o = v as Record<string, unknown>;
+      if ('error' in o || 'errors' in o) return false;
+      return Object.keys(o).length > 0;
+    }
+    return false;
+  } catch { return false; }
 }
 
 /**
@@ -28,7 +37,10 @@ export async function probeEndpointsUnauth(
   const base = appUrl.replace(/\/$/, '');
   const findings: Finding[] = [];
 
-  const targets = endpoints.filter((e) => e.method === 'GET' || e.method === 'ANY').slice(0, 60);
+  const candidates = endpoints.filter((e) => e.method === 'GET' || e.method === 'ANY');
+  const MAX = 60;
+  const targets = candidates.slice(0, MAX);
+  const dropped = candidates.length - targets.length;
   if (targets.length === 0) {
     return { findings, run: { id: 'endpoint-probe', level: 2, status: 'skipped', note: 'no GET endpoints discovered' } };
   }
@@ -38,7 +50,7 @@ export async function probeEndpointsUnauth(
     await sleep(rateLimitMs);
     const path = concretePath(e.path).replace(/^\/?/, '/');
     const res = await request(base + path, { headers: { accept: 'application/json' } });
-    if (isErr(res) || res.status === 429 || res.status >= 500) { errors++; continue; }
+    if (isErr(res) || res.status === 429 || res.status >= 500 || (res.status >= 300 && res.status < 400)) { errors++; continue; }
     if (res.status !== 200) continue;
     if (!looksLikeData(res.body)) continue;
 
@@ -55,7 +67,10 @@ export async function probeEndpointsUnauth(
     });
   }
 
-  const status = errors === 0 ? 'completed' : errors < targets.length ? 'partial' : 'failed';
-  const note = errors > 0 ? `${errors}/${targets.length} endpoint requests errored` : undefined;
+  const status = errors >= targets.length ? 'failed' : errors > 0 || dropped > 0 ? 'partial' : 'completed';
+  const notes: string[] = [];
+  if (errors > 0) notes.push(`${errors}/${targets.length} endpoint requests errored`);
+  if (dropped > 0) notes.push(`only ${MAX}/${candidates.length} endpoints probed (cap)`);
+  const note = notes.length ? notes.join('; ') : undefined;
   return { findings, run: { id: 'endpoint-probe', level: 2, status, note } };
 }

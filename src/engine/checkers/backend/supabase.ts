@@ -14,7 +14,7 @@ export interface SupabaseCreds {
 const URL_ASSIGN = /(?:NEXT_PUBLIC_|VITE_|PUBLIC_)?SUPABASE(?:_PUBLIC)?_URL\s*[:=]\s*["'`]?(https?:\/\/[^"'`\s]+)/i;
 const ANON_ASSIGN = /(?:NEXT_PUBLIC_|VITE_|PUBLIC_)?SUPABASE_(?:ANON|PUBLISHABLE)_KEY\s*[:=]\s*["'`]?([A-Za-z0-9._-]{20,})/i;
 
-function classifyKey(key: string): 'jwt-anon' | 'jwt-authenticated' | 'jwt-service' | 'publishable' | 'secret' | 'unknown' {
+export function classifyKey(key: string): 'jwt-anon' | 'jwt-authenticated' | 'jwt-service' | 'publishable' | 'secret' | 'unknown' {
   if (key.startsWith('sb_publishable_')) return 'publishable';
   if (key.startsWith('sb_secret_')) return 'secret';
   const payload = decodeJwtPayload(key);
@@ -78,11 +78,23 @@ export interface ProbeOptions {
   log?: (msg: string) => void;
 }
 
-// Table names that strongly imply private/PII/financial data → a real leak if open.
-const SENSITIVE = /user|account|payment|order|subscription|auth|session|email|customer|profile|token|secret|credential|invoice|billing|address|phone|card|password|member|contact|message|chat|kyc|passport/i;
+// Word-ish matching on the table name: "postcards" must not match "card",
+// "authors" must not match "auth", but "api_keys" and "ssn_records" must hit.
+const SENSITIVE_WORDS = [
+  'user', 'users', 'account', 'accounts', 'payment', 'payments', 'order', 'orders',
+  'subscription', 'subscriptions', 'auth', 'session', 'sessions', 'email', 'emails',
+  'customer', 'customers', 'profile', 'profiles', 'token', 'tokens', 'secret', 'secrets',
+  'credential', 'credentials', 'key', 'keys', 'apikey', 'apikeys', 'invoice', 'invoices',
+  'billing', 'address', 'addresses', 'phone', 'phones', 'card', 'cards', 'password',
+  'passwords', 'member', 'members', 'contact', 'contacts', 'message', 'messages', 'chat',
+  'chats', 'kyc', 'passport', 'ssn', 'pii', 'salary', 'salaries', 'payroll', 'health',
+  'medical', 'patient', 'patients', 'private', 'identity', 'identities', 'wallet', 'transaction', 'transactions',
+];
+const SENSITIVE_SET = new Set(SENSITIVE_WORDS);
 
 function severityForTable(table: string): Severity {
-  return SENSITIVE.test(table) ? 'critical' : 'warning';
+  const words = table.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return words.some((w) => SENSITIVE_SET.has(w) || SENSITIVE_SET.has(w.replace(/s$/, ''))) ? 'critical' : 'warning';
 }
 
 function authHeaders(key: string): Record<string, string> {
@@ -119,7 +131,7 @@ async function enumerate(creds: SupabaseCreds): Promise<{ tables: string[]; rpc:
   if (tables.length === 0) {
     tables = paths.filter((p) => /^\/[^/{}]+$/.test(p) && p !== '/rpc' && !p.startsWith('/rpc/')).map((p) => p.slice(1));
   }
-  const rpc = paths.filter((p) => p.startsWith('/rpc/')).map((p) => p.slice('/rpc/'.length));
+  const rpc = paths.filter((p) => p.startsWith('/rpc/')).map((p) => p.slice('/rpc/'.length)).filter(Boolean);
   return { tables, rpc };
 }
 
@@ -167,21 +179,23 @@ export async function probeSupabase(opts: ProbeOptions): Promise<ProbeResult> {
   for (const table of tables) {
     await sleep(rl);
     // HEAD + count=exact returns only the row count in a header — no data pulled.
-    const res = await request(`${creds.url}/rest/v1/${table}?select=*`, {
+    const res = await request(`${creds.url}/rest/v1/${encodeURIComponent(table)}?select=*`, {
       method: 'HEAD',
       headers: { ...authHeaders(creds.anonKey), Prefer: 'count=exact', Range: '0-0', 'Range-Unit': 'items' },
     });
-    if (isErr(res) || res.status === 429 || res.status >= 500) { errored++; continue; }
+    // 5xx/429/timeout AND 3xx (a login redirect) mean we learned nothing here.
+    if (isErr(res) || res.status === 429 || res.status >= 500 || (res.status >= 300 && res.status < 400)) { errored++; continue; }
     if (res.status === 200 || res.status === 206) {
       const count = parseCount(res.headers);
-      if (count === null || count > 0) {
+      if (count === null) { errored++; continue; } // no usable count → inconclusive, not proof
+      if (count > 0) {
         const sev = severityForTable(table);
         findings.push({
           id: 'supabase_anon_read',
           severity: sev,
           title: `Table "${table}" is readable by anyone`,
           detail:
-            (count === null ? `The public key can query "${table}".` : `The public key can read ${count} row(s) from "${table}".`) +
+            `The public key can read ${count} row(s) from "${table}".` +
             (sev === 'critical'
               ? ' The name suggests private/PII/financial data — if so, this is a serious leak.'
               : ' If this table is public content (e.g. products/articles) this may be intended — confirm.'),
@@ -198,12 +212,16 @@ export async function probeSupabase(opts: ProbeOptions): Promise<ProbeResult> {
   // Storage buckets listable by anon.
   await sleep(rl);
   const buckets = await request(`${creds.url}/storage/v1/bucket`, { headers: authHeaders(creds.anonKey) });
-  const storageErrored = unreliable(buckets);
+  let storageErrored = unreliable(buckets);
   if (!isErr(buckets) && buckets.status === 200) {
     try {
-      const list = JSON.parse(buckets.body) as Array<{ name?: string; public?: boolean }>;
-      if (Array.isArray(list) && list.length > 0) {
-        const publicOnes = list.filter((b) => b.public).map((b) => b.name).filter(Boolean).join(', ');
+      const parsed = JSON.parse(buckets.body) as unknown;
+      const list = (Array.isArray(parsed) ? parsed : (parsed as { buckets?: unknown })?.buckets) as
+        Array<string | { name?: string; id?: string; public?: boolean }> | undefined;
+      if (!Array.isArray(list)) throw new Error('unrecognized bucket listing');
+      if (list.length > 0) {
+        const objs = list.map((b) => (typeof b === 'string' ? { name: b } : b));
+        const publicOnes = objs.filter((b) => b.public).map((b) => b.name ?? b.id ?? '(unnamed)').join(', ');
         findings.push({
           id: 'supabase_bucket_listing',
           severity: publicOnes ? 'critical' : 'warning',
@@ -215,7 +233,7 @@ export async function probeSupabase(opts: ProbeOptions): Promise<ProbeResult> {
           endpoint: 'GET /storage/v1/bucket',
         });
       }
-    } catch { /* ignore */ }
+    } catch { storageErrored = true; } // a 200 we cannot parse is a lost sub-check
   }
 
   if (rpc.length > 0) {

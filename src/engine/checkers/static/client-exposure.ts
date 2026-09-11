@@ -6,8 +6,8 @@ const PUBLIC_PREFIX = '(?:NEXT_PUBLIC_|VITE_|REACT_APP_|EXPO_PUBLIC_|GATSBY_|PUB
 
 // A public var whose NAME implies a real secret (not an anon/publishable key).
 const PUBLIC_SECRET = new RegExp(
-  `\\b${PUBLIC_PREFIX}[A-Z0-9_]*(SERVICE_ROLE|SECRET|PRIVATE|PASSWORD|PASSWD)[A-Z0-9_]*\\s*[:=]\\s*["']?([^"'\\s]{6,})`,
-  'g',
+  `\\b${PUBLIC_PREFIX}[A-Z0-9_]*(SERVICE_ROLE|SECRET|PRIVATE|PASSWORD|PASSWD|TOKEN|CREDENTIAL|API_KEY|ACCESS_KEY)[A-Z0-9_]*\\s*[:=]\\s*["']?([^"'\\s]{6,})`,
+  'gi',
 );
 
 export const clientExposureChecker: Checker = {

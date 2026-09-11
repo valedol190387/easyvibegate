@@ -14,9 +14,13 @@ const TEXT_EXT = new Set([
   '.html', '.css', '.scss', '.json', '.yml', '.yaml', '.toml',
   '.env', '.sh', '.sql', '.md', '.txt', '.ini', '.conf', '.tf',
   '.pem', '.key', '.crt', '.cert', '.pkcs8',
+  '.astro', '.properties', '.plist', '.swift', '.dart', '.ipynb', '.bash', '.zsh', '.mdx',
 ]);
 
-const ALWAYS_NAMES = new Set(['Dockerfile', 'Gemfile', 'Procfile', 'Makefile', '.gitignore']);
+const ALWAYS_NAMES = new Set([
+  'Dockerfile', 'Gemfile', 'Procfile', 'Makefile', '.gitignore',
+  '.npmrc', '.netrc', '.yarnrc', '.dockerignore', 'env.local', 'credentials',
+]);
 
 const MAX_SIZE = 1024 * 1024; // 1 MB
 
@@ -27,9 +31,18 @@ function isScannable(name: string): boolean {
   return TEXT_EXT.has(extname(name).toLowerCase());
 }
 
+export interface WalkResult {
+  files: ScanFile[];
+  /** Files we could not read — recorded so a partial scan is never silent. */
+  skippedOversized: number;
+  skippedUnreadable: number;
+}
+
 /** Recursively collect scannable text files under `root`, skipping noise. */
-export function walk(root: string): ScanFile[] {
+export function walk(root: string): WalkResult {
   const out: ScanFile[] = [];
+  let skippedOversized = 0;
+  let skippedUnreadable = 0;
   const stack: string[] = [root];
 
   while (stack.length > 0) {
@@ -52,13 +65,15 @@ export function walk(root: string): ScanFile[] {
       try {
         st = statSync(full);
       } catch {
+        skippedUnreadable++;
         continue;
       }
-      if (st.size > MAX_SIZE) continue;
+      if (st.size > MAX_SIZE) { skippedOversized++; continue; }
       let content;
       try {
         content = readFileSync(full, 'utf8');
       } catch {
+        skippedUnreadable++;
         continue;
       }
       out.push({
@@ -70,5 +85,5 @@ export function walk(root: string): ScanFile[] {
       });
     }
   }
-  return out;
+  return { files: out, skippedOversized, skippedUnreadable };
 }

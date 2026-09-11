@@ -2,7 +2,7 @@ import { scanStatic, type ScanResult } from '../engine/scan.js';
 import { collectEndpoints } from '../engine/endpoints.js';
 import { applyIgnores, loadConfig } from '../engine/config.js';
 import { auditDeps } from '../engine/checkers/deep/deps.js';
-import { discoverSupabase, probeSupabase } from '../engine/checkers/backend/supabase.js';
+import { classifyKey, discoverSupabase, probeSupabase } from '../engine/checkers/backend/supabase.js';
 import { discoverFirebase, probeFirebase } from '../engine/checkers/backend/firebase.js';
 import { checkLiveSite } from '../engine/checkers/live/http-checks.js';
 import { probeEndpointsUnauth } from '../engine/checkers/live/endpoint-probe.js';
@@ -59,7 +59,7 @@ export async function runFlow(opts: FlowOptions): Promise<ScanResult> {
   // Level 2 — Supabase active probe (read-only).
   const sbCreds =
     opts.supabaseUrl && opts.supabaseKey
-      ? ({ url: opts.supabaseUrl, anonKey: opts.supabaseKey, keyKind: 'jwt-anon' } as const)
+      ? { url: opts.supabaseUrl, anonKey: opts.supabaseKey, keyKind: classifyKey(opts.supabaseKey) === 'publishable' ? 'publishable' as const : 'jwt-anon' as const }
       : discoverSupabase(visible);
   if (sbCreds) {
     const ok = await opts.consent({
@@ -67,7 +67,7 @@ export async function runFlow(opts: FlowOptions): Promise<ScanResult> {
       target: sbCreds.url,
       detail: 'read tables, buckets and RPC using the public key (read-only)',
     });
-    if (ok) {
+    if (ok === true) {
       log(`Level 2: probing Supabase ${sbCreds.url}…`);
       const r = await probeSupabase({ creds: sbCreds, log });
       findings.push(...r.findings);
@@ -85,7 +85,7 @@ export async function runFlow(opts: FlowOptions): Promise<ScanResult> {
       target: fbCreds.projectId,
       detail: 'anonymous reads of RTDB, Firestore and Storage',
     });
-    if (ok) {
+    if (ok === true) {
       log(`Level 2: probing Firebase ${fbCreds.projectId}…`);
       const r = await probeFirebase({ creds: fbCreds, log });
       findings.push(...r.findings);
@@ -102,7 +102,7 @@ export async function runFlow(opts: FlowOptions): Promise<ScanResult> {
       target: opts.appUrl,
       detail: 'passive checks (headers, exposed files) + unauthenticated endpoint probe',
     });
-    if (ok) {
+    if (ok === true) {
       log(`Level 2: live checks on ${opts.appUrl}…`);
       const site = await checkLiveSite(opts.appUrl);
       findings.push(...site.findings);
@@ -119,7 +119,7 @@ export async function runFlow(opts: FlowOptions): Promise<ScanResult> {
           target: opts.appUrl,
           detail: 'replay object-scoped endpoints with two accounts (IDOR test)',
         });
-        if (idorOk) {
+        if (idorOk === true) {
           const r = await idorDifferential(opts.appUrl, endpoints, opts.idorTokens[0], opts.idorTokens[1]);
           findings.push(...r.findings);
           runs.push(r.run);
@@ -128,7 +128,10 @@ export async function runFlow(opts: FlowOptions): Promise<ScanResult> {
         }
       }
     } else {
+      // Record every check the user asked for, so declining is visible as coverage.
       runs.push({ id: 'live-site', level: 2, status: 'skipped', note: 'declined' });
+      runs.push({ id: 'endpoint-probe', level: 2, status: 'skipped', note: 'declined' });
+      if (opts.idorTokens) runs.push({ id: 'idor', level: 2, status: 'skipped', note: 'declined' });
     }
   }
 

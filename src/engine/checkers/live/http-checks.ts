@@ -20,7 +20,7 @@ const EXPOSED: ExposedProbe[] = [
   { path: '.git/config', signature: /\[core\]|\[remote/, title: '.git/config served publicly', severity: 'critical' },
   { path: '.git/HEAD', signature: /^ref:\s/m, title: '.git/HEAD served publicly', severity: 'critical' },
   { path: 'backup.sql', signature: /CREATE TABLE|INSERT INTO/i, title: 'SQL backup served publicly', severity: 'critical' },
-  { path: 'config.json', signature: /[{][\s\S]*(key|secret|password|token)/i, title: 'config.json served publicly', severity: 'warning' },
+  { path: 'config.json', signature: /"[^"]*(api[_-]?key|secret|password|token|credential)[^"]*"\s*:/i, title: 'config.json served publicly', severity: 'warning' },
 ];
 
 interface HeaderCheck {
@@ -68,7 +68,8 @@ export async function checkLiveSite(appUrl: string): Promise<LiveResult> {
   // Follow redirects (bounded) so headers are read from the real page, not a 301/302 hop.
   // Only analyze headers on a reliable response — a 5xx/429 must not masquerade as "headers missing".
   const root = await requestFollow(base + '/');
-  if (!isErr(root) && root.status !== 429 && root.status < 500) {
+  // Only a genuine 2xx page supports a verdict about its headers.
+  if (!isErr(root) && root.status >= 200 && root.status < 300) {
     for (const h of SECURITY_HEADERS) {
       if (!root.headers.get(h.header)) {
         findings.push({
@@ -97,7 +98,7 @@ export async function checkLiveSite(appUrl: string): Promise<LiveResult> {
       });
     }
     // Inspect each Set-Cookie separately — one hardened cookie must not mask another.
-    const cookies = getSetCookies(root.headers);
+    const cookies = root.hopCookies?.length ? root.hopCookies : getSetCookies(root.headers);
     for (const c of cookies) {
       const name = c.split('=', 1)[0]?.trim() || 'cookie';
       const secure = /;\s*secure/i.test(c);
@@ -120,11 +121,13 @@ export async function checkLiveSite(appUrl: string): Promise<LiveResult> {
 
   // Aggregate: the root page AND every file probe count. Losing any sub-check = partial;
   // losing all of them = failed.
-  const rootBad = unreliable(root);
-  const status = rootBad && fileErrors === EXPOSED.length ? 'failed' : rootBad || fileErrors > 0 ? 'partial' : 'completed';
+  const rootBad = unreliable(root) || (!isErr(root) && (root.status < 200 || root.status >= 300));
+  const truncated = !isErr(root) && root.truncated === true;
+  const status = rootBad && fileErrors === EXPOSED.length ? 'failed' : rootBad || fileErrors > 0 || truncated ? 'partial' : 'completed';
   const notes: string[] = [];
-  if (rootBad) notes.push(isErr(root) ? `could not reach ${base}/` : `unreliable response (HTTP ${root.status}) from ${base}/`);
+  if (rootBad) notes.push(isErr(root) ? `could not reach ${base}/: ${root.error}` : `no usable 2xx page (HTTP ${root.status}) at ${base}/`);
   if (fileErrors > 0) notes.push(`${fileErrors}/${EXPOSED.length} exposed-file probes errored`);
+  if (!isErr(root) && root.truncated) notes.push('response body hit the 2 MB cap — content past it was not inspected');
   return { findings, run: { id: 'live-site', level: 2, status, note: notes.length ? notes.join('; ') : undefined } };
 }
 

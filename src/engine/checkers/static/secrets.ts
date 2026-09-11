@@ -7,6 +7,14 @@ interface Pattern {
   re: RegExp;
   severity: Severity;
   fix: string;
+  /** Extra shape check on the match — kills look-alikes (e.g. CSS class names). */
+  validate?: (match: string) => boolean;
+}
+
+/** Real tokens mix case and digits; kebab-case identifiers do not. */
+function looksRandom(s: string): boolean {
+  const body = s.replace(/^[a-z]+[-_]/i, '');
+  return /[A-Z]/.test(body) && /[0-9]/.test(body) && shannonEntropy(body) >= 3.2;
 }
 
 const PATTERNS: Pattern[] = [
@@ -16,6 +24,8 @@ const PATTERNS: Pattern[] = [
     re: /\bsk-(?!ant-)(?:proj-)?[A-Za-z0-9_-]{20,}\b/g,
     severity: 'critical',
     fix: 'Remove the key from source, read it from a server-side env var, and rotate it in the OpenAI dashboard.',
+    // ".sk-chase-dot-before-animation-delay" is a CSS class, not a key.
+    validate: looksRandom,
   },
   {
     id: 'anthropic_key',
@@ -23,6 +33,7 @@ const PATTERNS: Pattern[] = [
     re: /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g,
     severity: 'critical',
     fix: 'Move the key to a server-side env var and rotate it in the Anthropic console.',
+    validate: looksRandom,
   },
   {
     id: 'aws_key',
@@ -53,6 +64,27 @@ const PATTERNS: Pattern[] = [
     fix: 'Revoke the token in the Slack app settings and rotate it.',
   },
   {
+    id: 'sendgrid_key',
+    title: 'SendGrid API key',
+    re: /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/g,
+    severity: 'critical',
+    fix: 'Revoke the key in SendGrid and store it server-side only.',
+  },
+  {
+    id: 'hf_token',
+    title: 'Hugging Face token',
+    re: /\bhf_[A-Za-z0-9]{30,}\b/g,
+    severity: 'critical',
+    fix: 'Revoke the token in Hugging Face settings and keep it server-side.',
+  },
+  {
+    id: 'npm_token',
+    title: 'npm access token',
+    re: /\bnpm_[A-Za-z0-9]{30,}\b/g,
+    severity: 'critical',
+    fix: 'Revoke the token on npmjs.com and use a CI secret instead.',
+  },
+  {
     id: 'google_api_key',
     title: 'Google API key',
     re: /\bAIza[0-9A-Za-z_-]{35}\b/g,
@@ -65,6 +97,13 @@ const PATTERNS: Pattern[] = [
     re: /\b\d{8,10}:[A-Za-z0-9_-]{35}\b/g,
     severity: 'warning',
     fix: 'Revoke the token via BotFather and keep it server-side.',
+  },
+  {
+    id: 'db_url_password',
+    title: 'Database URL with an inline password',
+    re: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|mssql):\/\/[^\s:/@"']+:([^\s:/@"']{4,})@[^\s"']+/gi,
+    severity: 'critical',
+    fix: 'Move the connection string to a server-side env var and rotate the database password — a committed DB URL grants full data access.',
   },
   {
     id: 'supabase_secret_key',
@@ -82,23 +121,35 @@ const PATTERNS: Pattern[] = [
   },
 ];
 
-const GENERIC = /(?:api[_-]?key|secret|token|passwd|password|pwd|auth[_-]?token|access[_-]?token|client[_-]?secret)["']?\s*[:=]\s*["']([^"']{8,})["']/gi;
+const GENERIC = /(?:api[_-]?key|secret|token|passwd|password|pwd|auth[_-]?token|access[_-]?token|client[_-]?secret|credential)["']?\s*[:=]\s*["']([^"']{8,})["']/gi;
 
 const JWT = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
 
-// A KEY=value / key: value assignment whose NAME implies a secret.
-const ASSIGN = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*[:=][ \t]*(.+)$/gm;
+// KEY=value / key: value / Dockerfile ENV|ARG KEY=value, with a secret-looking NAME.
+const ASSIGN = /^[ \t]*(?:export[ \t]+|ENV[ \t]+|ARG[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*[:=][ \t]*(.+)$/gm;
 const SECRET_NAME = /(secret|token|password|passwd|private[_-]?key|api[_-]?key|access[_-]?key|credential)/i;
 
 /** Only .env* files are "server env by design" — a secret there is a warning
  *  (env-git flags committing it). In real code/config it stays a source leak. */
 function isEnvFile(rel: string): boolean {
-  return rel === '.env' || /(^|\/)\.env(\.|$)/.test(rel);
+  return /(^|\/)\.env($|\.)/.test(rel) && !/\.(example|sample|template)$/.test(rel);
 }
 
 /** Files where name=value secrets are worth scanning (env + common config). */
 function isConfigish(rel: string): boolean {
-  return isEnvFile(rel) || /\.(ya?ml|toml|ini|conf)$/.test(rel) || /(^|\/)Dockerfile$/.test(rel) || /docker-compose\.ya?ml$/.test(rel);
+  return /(^|\/)\.env($|\.)/.test(rel) || /\.(ya?ml|toml|ini|conf|properties|npmrc|netrc)$/.test(rel)
+    || /(^|\/)(Dockerfile|\.npmrc|\.netrc)$/.test(rel) || /docker-compose\.ya?ml$/.test(rel);
+}
+
+/**
+ * Documentation, examples and test fixtures are where sample keys legitimately
+ * live. A hit there is worth mentioning but is not a credential leak.
+ */
+function isExampleContext(rel: string): boolean {
+  return /\.(md|txt|mdx|rst)$/i.test(rel)
+    || /\.(example|sample|template|dist)$/i.test(rel)
+    || /(^|\/)(docs?|examples?|fixtures?|__fixtures__|__tests__|test|tests|spec|__mocks__)(\/|$)/i.test(rel)
+    || /\.(test|spec)\.[a-z]+$/i.test(rel);
 }
 
 export const secretsChecker: Checker = {
@@ -109,29 +160,43 @@ export const secretsChecker: Checker = {
     const findings: Finding[] = [];
 
     for (const file of ctx.files) {
-      const { content, rel } = file;
+      const { rel } = file;
+      const content = file.content.replace(/^\uFEFF/, ''); // a BOM must not eat line 1
       const env = isEnvFile(rel);
+      const example = isExampleContext(rel);
+
+      const push = (f: Finding) => {
+        if (example) {
+          findings.push({
+            ...f,
+            severity: 'info',
+            title: `${f.title} (in docs/example file)`,
+            detail: `${f.detail} This looks like documentation or a fixture — confirm it is not a real credential.`,
+          });
+        } else findings.push(f);
+      };
 
       for (const p of PATTERNS) {
         for (const m of content.matchAll(p.re)) {
+          const hit = m[0];
+          if (looksLikePlaceholder(hit)) continue; // YOUR_KEY / EXAMPLE / xxxxx / <...>
+          if (p.validate && !p.validate(hit)) continue;
           // A secret in a server env/config file is expected — the risk is
-          // committing it (env-git flags that), so it is a warning, not a source leak.
+          // committing it (env-git flags that), so it is a warning, not a leak.
           const severity = env && p.severity === 'critical' ? 'warning' : p.severity;
-          findings.push({
+          push({
             id: p.id,
             severity,
             title: env ? `${p.title} (in env/config file)` : p.title,
             detail: env
-              ? `${p.title} in ${rel} (${redact(m[0])}). Normal for server env — keep this file gitignored and out of client bundles.`
-              : `${p.title} found in source: ${redact(m[0])}`,
-            fix: env
-              ? 'Keep this file out of git and out of client bundles; rotate the value if it may have been committed.'
-              : p.fix,
+              ? `${p.title} in ${rel} (${redact(hit)}). Normal for server env — keep this file gitignored and out of client bundles.`
+              : `${p.title} found in source: ${redact(hit)}`,
+            fix: env ? 'Keep this file out of git and out of client bundles; rotate the value if it may have been committed.' : p.fix,
             checker: 'secrets',
             level: 0,
             file: rel,
             line: lineAt(content, m.index ?? 0),
-            evidence: redact(m[0]),
+            evidence: redact(hit),
           });
         }
       }
@@ -140,7 +205,7 @@ export const secretsChecker: Checker = {
       for (const m of content.matchAll(JWT)) {
         const payload = decodeJwtPayload(m[0]);
         if (payload && payload['role'] === 'service_role') {
-          findings.push({
+          push({
             id: 'supabase_service_role_key',
             severity: env ? 'warning' : 'critical',
             title: env ? 'Supabase service_role key (in env/config file)' : 'Supabase service_role key in source',
@@ -159,13 +224,11 @@ export const secretsChecker: Checker = {
         }
       }
 
-      if (rel.endsWith('.md') || rel.endsWith('.txt')) continue;
-
       // Quoted key/secret assignments in code, filtered by placeholder + entropy.
       for (const m of content.matchAll(GENERIC)) {
         const value = m[1] ?? '';
         if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.2) continue;
-        findings.push({
+        push({
           id: 'generic_secret',
           severity: 'warning',
           title: 'Possible hardcoded secret',
@@ -179,20 +242,19 @@ export const secretsChecker: Checker = {
         });
       }
 
-      // name=value / key: value assignments with a secret-looking NAME (env + config).
-      // Parsing name and value separately catches bare `PASSWORD=...`.
+      // name=value / key: value assignments (env, config, Dockerfile ENV/ARG).
       if (isConfigish(rel)) {
         for (const m of content.matchAll(ASSIGN)) {
           const name = m[1] ?? '';
           if (!SECRET_NAME.test(name)) continue;
           const value = (m[2] ?? '').trim().replace(/^["']|["']$/g, '').replace(/["'].*$/, '');
           if (value.length < 8 || looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
-          findings.push({
+          push({
             id: 'env_secret',
             severity: 'warning',
-            title: isEnvFile(rel) ? 'Secret in env file' : 'Secret in config file',
+            title: env ? 'Secret in env file' : 'Secret in config file',
             detail: `"${name}" holds a high-entropy value in ${rel}: ${redact(value)}`,
-            fix: isEnvFile(rel)
+            fix: env
               ? 'Fine for server env — keep this file gitignored and out of the client; rotate if it may have leaked.'
               : 'Move this secret out of committed config into a server-side secret store, and rotate it.',
             checker: 'secrets',
@@ -205,16 +267,15 @@ export const secretsChecker: Checker = {
       }
     }
 
-    // De-duplicate multiple matches on the same file:line, keeping the most severe.
+    // De-duplicate only true repeats: the same secret, same place, same rule.
+    // (Keying on file:line alone hid every extra key on a minified line.)
     const rank: Record<Severity, number> = { critical: 0, warning: 1, info: 2, advisory: 3 };
-    const byLine = new Map<string, Finding>();
-    const passthrough: Finding[] = [];
+    const seen = new Map<string, Finding>();
     for (const f of findings) {
-      if (f.file === undefined || f.line === undefined) { passthrough.push(f); continue; }
-      const key = `${f.file}:${f.line}`;
-      const cur = byLine.get(key);
-      if (!cur || rank[f.severity] < rank[cur.severity]) byLine.set(key, f);
+      const key = `${f.file ?? ''}:${f.line ?? 0}:${f.id}:${f.evidence ?? ''}`;
+      const cur = seen.get(key);
+      if (!cur || rank[f.severity] < rank[cur.severity]) seen.set(key, f);
     }
-    return [...passthrough, ...byLine.values()];
+    return [...seen.values()];
   },
 };

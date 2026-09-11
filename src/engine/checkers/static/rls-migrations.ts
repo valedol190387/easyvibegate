@@ -6,6 +6,8 @@ const QUALIFIED = `(?:(${IDENT})\\s*\\.\\s*)?(${IDENT})`;
 const CREATE_TABLE = new RegExp(`create\\s+table\\s+(if\\s+not\\s+exists\\s+)?${QUALIFIED}`, 'gi');
 const RLS_STMT = new RegExp(`alter\\s+table\\s+(?:only\\s+)?${QUALIFIED}\\s+(enable|disable)\\s+row\\s+level\\s+security`, 'gi');
 const DROP_TABLE = new RegExp(`drop\\s+table\\s+(?:if\\s+exists\\s+)?${QUALIFIED}`, 'gi');
+// SELECT ... INTO <table> also creates a table.
+const SELECT_INTO = new RegExp(`\\bselect\\b[^;]{0,400}?\\binto\\s+${QUALIFIED}`, 'gis');
 
 /** Normalize one SQL identifier: quoted keeps case, unquoted folds to lowercase. */
 function normIdent(raw: string): string {
@@ -58,6 +60,10 @@ export function maskSql(sql: string): string {
         const tag = m[0];
         const close = sql.indexOf(tag, i + tag.length);
         const end = close === -1 ? n : close + tag.length;
+        // `DO $$ ... $$` is executed procedural code: its DDL is real, so keep it
+        // visible. Other dollar-quoted strings (EXECUTE format(...)) are blanked.
+        const isDoBlock = /\bdo\s*$/i.test(sql.slice(Math.max(0, i - 8), i));
+        if (isDoBlock) { blank(i, i + tag.length); blank(close === -1 ? n : close, end); i = i + tag.length; continue; }
         blank(i, end); i = end; continue;
       }
     }
@@ -92,6 +98,19 @@ export const rlsMigrationsChecker: Checker = {
     const sqlFiles = ctx.files.filter((f) => f.ext === '.sql').sort((a, b) => a.rel.localeCompare(b.rel));
     if (sqlFiles.length === 0) return [];
 
+    // RLS is a PostgreSQL feature. Do not tell a MySQL/SQLite project to enable it.
+    const allSql = sqlFiles.map((f) => f.content).join('\n');
+    const pkg = ctx.files.find((f) => f.rel === 'package.json')?.content ?? '';
+    const postgresish =
+      ctx.detection.backends.includes('supabase') ||
+      /\b(pg|postgres|postgresql|@supabase\/|drizzle-orm|postgres\.js|node-postgres)\b/i.test(pkg) ||
+      /(enable\s+row\s+level\s+security|gen_random_uuid|\bserial\b|::\s*\w+|\bjsonb\b)/i.test(allSql) ||
+      /\b(psycopg|asyncpg|sqlalchemy\+postgres)\b/i.test(ctx.files.find((f) => f.rel === 'requirements.txt')?.content ?? '');
+    const otherEngine =
+      /(engine\s*=\s*innodb|auto_increment|\bpragma\b|`\w+`\s*varchar)/i.test(allSql) ||
+      /\b(mysql2?|sqlite3|better-sqlite3|mariadb)\b/i.test(pkg);
+    if (otherEngine && !postgresish) return [];
+
     const events: Event[] = [];
     sqlFiles.forEach((f, fileIdx) => {
       const masked = maskSql(f.content);
@@ -100,6 +119,7 @@ export const rlsMigrationsChecker: Checker = {
       for (const m of masked.matchAll(CREATE_TABLE)) push('create', m[2], m[3] ?? '', m.index ?? 0, !!m[1]);
       for (const m of masked.matchAll(RLS_STMT)) push((m[3] ?? '').toLowerCase() === 'disable' ? 'disable' : 'enable', m[1], m[2] ?? '', m.index ?? 0);
       for (const m of masked.matchAll(DROP_TABLE)) push('drop', m[1], m[2] ?? '', m.index ?? 0);
+      for (const m of masked.matchAll(SELECT_INTO)) push('create', m[1], m[2] ?? '', m.index ?? 0);
     });
     // True apply order: by migration file, then by statement position in the file.
     events.sort((a, b) => a.fileIdx - b.fileIdx || a.offset - b.offset);
@@ -120,9 +140,28 @@ export const rlsMigrationsChecker: Checker = {
       state.set(e.key, cur);
     }
 
+    // Cross-directory file order is a guess (a root-level policies file sorts
+    // before supabase/migrations/*). So an ENABLE seen anywhere counts, unless a
+    // DISABLE/recreate happened later *within the same file*, where order is real.
+    const everEnabled = new Set(events.filter((e) => e.kind === 'enable').map((e) => e.key));
+    const disabledInFile = new Set<string>();
+    for (const f of sqlFiles) {
+      const inFile = events.filter((e) => e.file === f.rel).sort((a, b) => a.offset - b.offset);
+      const last = new Map<string, Event['kind']>();
+      for (const e of inFile) {
+        if (e.kind === 'create' && e.ifNotExists && last.get(e.key) === 'enable') continue;
+        last.set(e.key, e.kind);
+      }
+      for (const [k, kind] of last) if (kind === 'disable' || kind === 'create') {
+        if (inFile.some((e) => e.key === k && e.kind === 'enable')) disabledInFile.add(k);
+      }
+    }
+
     const findings: Finding[] = [];
-    for (const s of state.values()) {
-      if (!s.created || s.enabled) continue;
+    for (const [key, s] of state) {
+      if (!s.created) continue;
+      if (everEnabled.has(key) && !disabledInFile.has(key)) continue;
+      if (s.enabled) continue;
       findings.push({
         id: 'rls_missing',
         severity: 'critical',

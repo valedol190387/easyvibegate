@@ -21,7 +21,7 @@ export interface ScanOptions {
 
 /** Run all Level 0 (static, read-only) checkers over a project directory. */
 export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<ScanResult> {
-  const files = walk(root);
+  const { files, skippedOversized, skippedUnreadable } = walk(root);
   const detection = detect(root, files);
   const ctx = { root, files, detection };
 
@@ -37,6 +37,15 @@ export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<
       runs.push({ id: `static:${checker.id}`, level: 0, status: 'skipped', note: 'no files to check' });
     }
     return { root, detection, findings, fileCount: 0, files, runs };
+  }
+
+  // Files we could not read are missing coverage, not a clean result.
+  const lost = skippedOversized + skippedUnreadable;
+  if (lost > 0) {
+    const parts: string[] = [];
+    if (skippedOversized) parts.push(`${skippedOversized} over the 1 MB limit`);
+    if (skippedUnreadable) parts.push(`${skippedUnreadable} unreadable`);
+    runs.push({ id: 'walk', level: 0, status: 'partial', note: `${lost} file(s) not scanned (${parts.join(', ')})` });
   }
 
   for (const checker of staticCheckers) {
@@ -55,6 +64,9 @@ export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<
   }
 
   const config = loadConfig(root, opts.configPath);
+  if (config.problem) {
+    runs.push({ id: 'config', level: 0, status: 'failed', note: `${config.problem} — suppression rules were NOT applied` });
+  }
   findings = applyIgnores(findings, config, files);
 
   return { root, detection, findings, fileCount: files.length, files, runs };

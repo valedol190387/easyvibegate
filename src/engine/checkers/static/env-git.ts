@@ -1,6 +1,4 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import type { Checker, Finding } from '../../types.js';
 
 function gitOk(root: string, args: string[]): boolean {
@@ -28,7 +26,8 @@ export const envGitChecker: Checker = {
     if (envFiles.length === 0) return [];
 
     const findings: Finding[] = [];
-    const isGit = existsSync(join(ctx.root, '.git'));
+    // Ask git itself: a subdirectory of a repo (monorepo package) is still in git.
+    const isGit = gitOk(ctx.root, ['rev-parse', '--git-dir']);
 
     if (!isGit) {
       findings.push({

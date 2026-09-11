@@ -3,6 +3,10 @@ export interface HttpOk {
   ok: boolean;
   headers: Headers;
   body: string;
+  /** The body hit the buffer cap — anything past it was not seen. */
+  truncated?: boolean;
+  /** Set-Cookie values seen on every hop of a followed redirect chain. */
+  hopCookies?: string[];
 }
 export interface HttpErr {
   error: string;
@@ -21,11 +25,11 @@ export function unreliable(r: HttpResult): boolean {
 // Cap the response body we buffer so a huge/hostile response can't blow up memory.
 const MAX_BODY_BYTES = 2 * 1024 * 1024; // 2 MB
 
-async function readCapped(res: Response, max: number): Promise<string> {
+async function readCapped(res: Response, max: number): Promise<{ text: string; truncated: boolean }> {
   const reader = res.body?.getReader();
   if (!reader) {
     const t = await res.text();
-    return t.length > max ? t.slice(0, max) : t;
+    return t.length > max ? { text: t.slice(0, max), truncated: true } : { text: t, truncated: false };
   }
   const chunks: Buffer[] = [];
   let total = 0;
@@ -41,7 +45,11 @@ async function readCapped(res: Response, max: number): Promise<string> {
       }
     }
   }
-  return Buffer.concat(chunks).subarray(0, max).toString('utf8');
+  const buf = Buffer.concat(chunks);
+  const truncated = total >= max;
+  // Decode without leaving a mangled partial character at the cut.
+  const text = new TextDecoder('utf-8', { fatal: false }).decode(buf.subarray(0, max)).replace(/\uFFFD$/, '');
+  return { text, truncated };
 }
 
 export type RequestFn = (url: string, init?: RequestInit, timeoutMs?: number) => Promise<HttpResult>;
@@ -53,8 +61,8 @@ async function realRequest(url: string, init: RequestInit = {}, timeoutMs = 8000
   try {
     // Default to not following redirects (safer for probing); callers may opt in.
     const res = await fetch(url, { redirect: 'manual', ...init, signal: controller.signal });
-    const body = await readCapped(res, MAX_BODY_BYTES);
-    return { status: res.status, ok: res.status >= 200 && res.status < 300, headers: res.headers, body };
+    const { text, truncated } = await readCapped(res, MAX_BODY_BYTES);
+    return { status: res.status, ok: res.status >= 200 && res.status < 300, headers: res.headers, body: text, truncated };
   } catch (e) {
     return { error: e instanceof Error ? e.message : String(e) };
   } finally {
@@ -86,20 +94,33 @@ export async function requestFollow(
   maxHops = 5,
 ): Promise<HttpResult> {
   let current = url;
+  const hopCookies: string[] = [];
   for (let hop = 0; hop <= maxHops; hop++) {
     const res = await request(current, { ...init, redirect: 'manual' }, timeoutMs);
     if (isErr(res)) return res;
+    // A session cookie is usually set on the login redirect, not the final page.
+    const withGetter = res.headers as Headers & { getSetCookie?: () => string[] };
+    hopCookies.push(...(typeof withGetter.getSetCookie === 'function'
+      ? withGetter.getSetCookie()
+      : (res.headers.get('set-cookie') ? [res.headers.get('set-cookie') as string] : [])));
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get('location');
       if (!loc) return res;
+      let next: URL;
       try {
-        current = new URL(loc, current).toString();
+        next = new URL(loc, current);
       } catch {
         return res;
       }
+      // Staying on the target origin is the point: otherwise a third party's
+      // headers/body would be credited to the app we were asked to check.
+      if (next.origin !== new URL(url).origin) {
+        return { error: `redirect left the target origin (${next.origin})` };
+      }
+      current = next.toString();
       continue;
     }
-    return res;
+    return { ...res, hopCookies };
   }
   return { error: `too many redirects (>${maxHops})` };
 }

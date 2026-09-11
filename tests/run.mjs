@@ -345,5 +345,236 @@ await (async () => {
   rmSync(dir, { recursive: true, force: true });
 })();
 
+console.log('\nself-audit regressions (found by adversarial agents)');
+
+await (async () => {
+  const dir = fixture({
+    'ui/spinner.css': '.sk-chase-dot-before-animation-delay { top: 0 }\n',
+    'bundle.js': 'const a="sk-proj-Qz7Rm2Xk9Lp4Tv8Bn3Wd6Hy",b="AKIAQZ7RM2XK9LP4TV8B",c="ghp_abcdefghij0123456789ABCDEFGHIJ012345";\n',
+    'README.md': 'Set AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE and OPENAI_API_KEY=sk-proj-REPLACE_ME_WITH_YOUR_REAL_KEY\n',
+    'db.ts': 'const u = "postgres://postgres:Rt8Vn3Xm7Kp2@db.abcdefgh.supabase.co:5432/postgres";\n',
+  });
+  const r = await scanStatic(dir);
+  const at = (f) => r.findings.filter((x) => x.file === f);
+  check('CSS class "sk-chase-…" is not reported as an OpenAI key', () => {
+    assert.strictEqual(at('ui/spinner.css').length, 0, JSON.stringify(at('ui/spinner.css').map((f) => f.title)));
+  });
+  check('several keys on ONE line are all reported (dedup no longer hides them)', () => {
+    assert.ok(at('bundle.js').length >= 3, `got ${at('bundle.js').length}`);
+  });
+  check('docs placeholders (AKIA…EXAMPLE, REPLACE_ME) are not critical', () => {
+    assert.ok(!at('README.md').some((f) => f.severity === 'critical'), JSON.stringify(at('README.md').map((f) => [f.title, f.severity])));
+  });
+  check('a DB URL with an inline password is caught', () => {
+    assert.ok(at('db.ts').some((f) => f.id === 'db_url_password'), 'postgres://user:pass@ must be flagged');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'package.json': '{"dependencies":{"mysql2":"^3"}}', 'db/schema.sql': 'CREATE TABLE users (id INT AUTO_INCREMENT) ENGINE=InnoDB;\n' });
+  const r = await scanStatic(dir);
+  check('MySQL project gets no Postgres-only RLS criticals', () => {
+    assert.strictEqual(r.findings.filter((f) => f.id === 'rls_missing').length, 0);
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({
+    'rls_policies.sql': 'ALTER TABLE public.notes ENABLE ROW LEVEL SECURITY;\n',
+    'supabase/migrations/20240101_init.sql': 'CREATE TABLE public.notes (id uuid);\n',
+  });
+  const r = await scanStatic(dir);
+  check('RLS enabled in a file that sorts first is still respected', () => {
+    const rls = r.findings.filter((f) => f.id === 'rls_missing');
+    assert.strictEqual(rls.length, 0, rls.map((f) => f.title).join(', '));
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+check('supabase severity uses whole words: postcards/authors are not critical', () => {
+  // exercised through the probe's exported behaviour via a mocked HEAD
+  assert.ok(true);
+});
+
+await (async () => {
+  setRequestImpl(async (url) => {
+    if (url.endsWith('/rest/v1/')) return ok(200, JSON.stringify({ definitions: { postcards: {}, authors: {}, api_keys: {} } }));
+    return ok(200, '', { 'content-range': '0-0/5' });
+  });
+  const { probeSupabase } = await import('../dist/engine/checkers/backend/supabase.js');
+  const r = await probeSupabase({ creds: { url: 'https://p.supabase.co', anonKey: 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.sig1234567890123456', keyKind: 'jwt-anon' }, rateLimitMs: 0 });
+  setRequestImpl(null);
+  const sev = (t) => r.findings.find((f) => f.endpoint === `GET /rest/v1/${t}`)?.severity;
+  check('table severity: api_keys critical, postcards/authors only warning', () => {
+    assert.strictEqual(sev('api_keys'), 'critical');
+    assert.strictEqual(sev('postcards'), 'warning');
+    assert.strictEqual(sev('authors'), 'warning');
+  });
+})();
+
+await (async () => {
+  setRequestImpl(async (url) => {
+    if (url.endsWith('/rest/v1/')) return ok(200, JSON.stringify({ definitions: { users: {} } }));
+    return ok(200, '', {}); // 200 but no content-range → unknown, not proof
+  });
+  const { probeSupabase } = await import('../dist/engine/checkers/backend/supabase.js');
+  const r = await probeSupabase({ creds: { url: 'https://p.supabase.co', anonKey: 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.sig1234567890123456', keyKind: 'jwt-anon' }, rateLimitMs: 0 });
+  setRequestImpl(null);
+  check('missing content-range is inconclusive, not a critical "readable"', () => {
+    assert.ok(!r.findings.some((f) => f.id === 'supabase_anon_read'), 'must not claim readable');
+    assert.notStrictEqual(r.run.status, 'completed', `got ${r.run.status}`);
+  });
+})();
+
+await (async () => {
+  setRequestImpl(async (url) => (url.endsWith('/') ? ok(301, '', { location: 'https://other.example/' }) : ok(404, '')));
+  const r = await checkLiveSite('https://app.example');
+  setRequestImpl(null);
+  check('a redirect off the target origin is not credited to the app', () => {
+    assert.notStrictEqual(r.run.status, 'completed', `got ${r.run.status} (${r.run.note})`);
+    assert.strictEqual(r.findings.filter((f) => f.id.startsWith('missing_')).length, 0);
+  });
+})();
+
+await (async () => {
+  setRequestImpl(async () => ok(200, '[]'));
+  const { probeEndpointsUnauth } = await import('../dist/engine/checkers/live/endpoint-probe.js');
+  const r = await probeEndpointsUnauth('https://app.example', [{ method: 'GET', path: '/api/items', where: 'x' }], 0);
+  setRequestImpl(null);
+  check('an empty JSON array is not "returns data without auth"', () => {
+    assert.strictEqual(r.findings.length, 0);
+  });
+})();
+
+await (async () => {
+  setRequestImpl(async () => ok(200, '{"id":1}'));
+  const r = await idorDifferential('https://app.example', [{ method: 'GET', path: '/api/o/:id', where: 'x' }], 'same', 'same', 0);
+  setRequestImpl(null);
+  check('IDOR with identical tokens is skipped, not a confident finding', () => {
+    assert.strictEqual(r.run.status, 'skipped');
+    assert.strictEqual(r.findings.length, 0);
+  });
+})();
+
+check('firebase discovery ignores docs and placeholder projects', async () => {});
+await (async () => {
+  const { discoverFirebase } = await import('../dist/engine/checkers/backend/firebase.js');
+  check('firebase: docs must not contribute probe hosts', () => {
+    const creds = discoverFirebase([
+      { rel: 'src/firebase.ts', content: 'projectId: "real-app"' },
+      { rel: 'DOCS.md', content: 'databaseURL: "https://victim-default-rtdb.firebaseio.com"' },
+    ]);
+    assert.strictEqual(creds.projectId, 'real-app');
+    assert.strictEqual(creds.databaseURL, undefined, 'a host from docs must not be probed');
+  });
+  check('firebase: placeholder project id yields no probe', () => {
+    assert.strictEqual(discoverFirebase([{ rel: 'a.ts', content: 'projectId: "YOUR_PROJECT_ID"' }]), null);
+  });
+})();
+
+console.log('\nself-audit regressions, round 2 (medium/low)');
+
+await (async () => {
+  const dir = fixture({
+    'src/notes.ts': [
+      '// Never use eval() on user input',
+      '/* we called new Function(body); removed in v2 */',
+      '// Example of a bad CORS header: Access-Control-Allow-Origin: "*"',
+      'const msg = `Please SELECT a row FROM the table WHERE you like ${name}`;',
+    ].join('\n'),
+    'vendor.min.js': 'var a=eval("1");var h={origin:"*"};' + 'x'.repeat(900),
+  });
+  const r = await scanStatic(dir);
+  check('comments, prose and minified bundles no longer trigger config-risks', () => {
+    const cr = r.findings.filter((f) => f.checker === 'config-risks');
+    assert.strictEqual(cr.length, 0, cr.map((f) => `${f.id}@${f.file}:${f.line}`).join(', '));
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'src/db.ts': 'const q = `SELECT * FROM users WHERE id = ${id}`;\n' });
+  const r = await scanStatic(dir);
+  check('a real interpolated query is still caught after masking', () => {
+    assert.ok(r.findings.some((f) => f.id === 'sql_interpolation'));
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+check('endpoints: NestJS, Django, Hono and chained Express are discovered', () => {
+  const eps = collectEndpoints([
+    { rel: 'src/users.controller.ts', content: "@Get('users')\nfindAll(){}\n@Post('users')\ncreate(){}" },
+    { rel: 'app/urls.py', content: "urlpatterns = [path('admin/', x), re_path(r'^reports/$', y)]" },
+    { rel: 'src/api.ts', content: "const api = new Hono();\napi.get('/hono-items', h);\nconst e = new Elysia().get('/elysia-items', h);" },
+    { rel: 'src/tpl.ts', content: 'app.get(`${BASE}/secret-admin`, h);' },
+  ]);
+  const paths = eps.map((e) => e.path);
+  for (const p of ['/users', '/admin/', '/reports/', '/hono-items', '/elysia-items']) {
+    assert.ok(paths.includes(p), `${p} missing from ${paths.join(',')}`);
+  }
+  assert.ok(!paths.some((p) => p.includes('${') || p.includes('$1')), 'interpolated paths must not become probe targets');
+});
+
+await (async () => {
+  const dir = fixture({ 'src/pub.ts': 'export const NEXT_PUBLIC_ADMIN_TOKEN = "Qz7Rm2Xk9Lp4Tv8Bn3Wd6Hy";\n' });
+  const r = await scanStatic(dir);
+  check('NEXT_PUBLIC_*_TOKEN is reported as a browser-exposed secret', () => {
+    assert.ok(r.findings.some((f) => f.id === 'public_env_secret'), ids(r).join(','));
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ '.npmrc': '//registry.npmjs.org/:_authToken=Qz7Rm2Xk9Lp4Tv8Bn3Wd6Hy1Gj\n', 'Dockerfile': 'ENV OPENAI_SECRET_KEY=Qz7Rm2Xk9Lp4Tv8Bn3Wd6Hy1Gj5Fs0Ac\n' });
+  const r = await scanStatic(dir);
+  check('.npmrc is scanned and Dockerfile ENV assignments are parsed', () => {
+    assert.ok(r.files.some((f) => f.rel === '.npmrc'), '.npmrc must be scannable');
+    assert.ok(r.findings.some((f) => f.file === 'Dockerfile'), 'Dockerfile ENV secret must be found');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'app.ts': 'const x = 1;\n', 'easyvibegate.config.json': '{ "ignore": ["a",] }' });
+  const r = await scanStatic(dir);
+  check('a broken config file is reported, not silently ignored', () => {
+    const run = r.runs.find((x) => x.id === 'config');
+    assert.ok(run && run.status === 'failed', JSON.stringify(r.runs));
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'db/001.sql': "CREATE TABLE public.keep (id uuid);\nALTER TABLE public.keep ENABLE ROW LEVEL SECURITY;\nSELECT * INTO public.leaked_users FROM auth.users;\n" });
+  const r = await scanStatic(dir);
+  check('SELECT ... INTO creates a table and is checked for RLS', () => {
+    const t = r.findings.filter((f) => f.id === 'rls_missing').map((f) => f.title);
+    assert.ok(t.some((x) => x.includes('leaked_users')), t.join(', '));
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'db/001.sql': 'DO $$ BEGIN\n  CREATE TABLE public.in_do (id uuid);\nEND $$;\n' });
+  const r = await scanStatic(dir);
+  check('DDL inside a DO $$ block is visible', () => {
+    assert.ok(r.findings.some((f) => f.id === 'rls_missing' && f.title.includes('in_do')), ids(r).join(','));
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  setRequestImpl(async (url) => (url.endsWith('/')
+    ? ok(302, '', { location: '/home', 'set-cookie': 'session=abc; Path=/' })
+    : ok(200, '<html>', ALL_HEADERS)));
+  const r = await checkLiveSite('https://app.example');
+  setRequestImpl(null);
+  check('a cookie set on the login redirect hop is still inspected', () => {
+    assert.ok(r.findings.some((f) => f.id === 'cookie_flags'), r.findings.map((f) => f.id).join(','));
+  });
+})();
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);

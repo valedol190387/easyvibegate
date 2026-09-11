@@ -1,5 +1,6 @@
 import type { CheckRun, Finding, ScanFile } from '../../types.js';
 import { isErr, request, sleep, unreliable } from '../../net/http.js';
+import { looksLikePlaceholder } from '../../util/text.js';
 
 export interface FirebaseProbeResult {
   findings: Finding[];
@@ -18,7 +19,9 @@ const COMMON_COLLECTIONS = [
 ];
 
 /** Extract Firebase project identifiers from client config in the source. */
-export function discoverFirebase(files: Pick<ScanFile, 'content'>[]): FirebaseCreds | null {
+export function discoverFirebase(all: Pick<ScanFile, 'content' | 'rel'>[]): FirebaseCreds | null {
+  // Docs/examples must not contribute hosts we would then send requests to.
+  const files = all.filter((f) => !/\.(md|txt|mdx|rst)$/i.test(f.rel));
   let projectId: string | undefined;
   let databaseURL: string | undefined;
   let storageBucket: string | undefined;
@@ -34,13 +37,44 @@ export function discoverFirebase(files: Pick<ScanFile, 'content'>[]): FirebaseCr
     }
   }
 
-  return projectId ? { projectId, databaseURL, storageBucket } : null;
+  if (!projectId || looksLikePlaceholder(projectId)) return null;
+  // Only keep hosts that belong to the project we will name in the consent prompt.
+  if (databaseURL && !databaseURL.includes(projectId)) databaseURL = undefined;
+  if (storageBucket && !storageBucket.includes(projectId)) storageBucket = undefined;
+  return { projectId, databaseURL, storageBucket };
 }
 
 export interface FirebaseProbeOptions {
   creds: FirebaseCreds;
   rateLimitMs?: number;
   log?: (msg: string) => void;
+}
+
+/** Only a parsable, non-empty JSON payload proves anonymous read access. */
+function hasJsonData(body: string): boolean {
+  try {
+    const v = JSON.parse(body) as unknown;
+    if (v === null || v === undefined) return false;
+    if (Array.isArray(v)) return v.length > 0;
+    if (typeof v === 'object') {
+      const o = v as Record<string, unknown>;
+      if ('error' in o) return false;
+      return Object.keys(o).length > 0;
+    }
+    return true;
+  } catch { return false; }
+}
+function hasFirestoreDocs(body: string): boolean {
+  try {
+    const v = JSON.parse(body) as { documents?: unknown[]; error?: unknown };
+    return !v.error && Array.isArray(v.documents) && v.documents.length > 0;
+  } catch { return false; }
+}
+function hasStorageObjects(body: string): boolean {
+  try {
+    const v = JSON.parse(body) as { items?: unknown[]; prefixes?: unknown[]; error?: unknown };
+    return !v.error && ((Array.isArray(v.items) && v.items.length > 0) || (Array.isArray(v.prefixes) && v.prefixes.length > 0));
+  } catch { return false; }
 }
 
 /** Probe Firebase RTDB, Firestore and Storage for anonymous read access. */
@@ -56,8 +90,8 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Firebas
   const rtdbBase = creds.databaseURL?.replace(/\/$/, '') ?? `https://${creds.projectId}-default-rtdb.firebaseio.com`;
   await sleep(rl);
   const rtdb = await request(`${rtdbBase}/.json?shallow=true`);
-  attempts++; if (unreliable(rtdb)) errors++;
-  if (!isErr(rtdb) && rtdb.status === 200 && rtdb.body.trim() !== 'null') {
+  attempts++; if (unreliable(rtdb) || (!isErr(rtdb) && rtdb.status >= 300 && rtdb.status < 400)) errors++;
+  if (!isErr(rtdb) && rtdb.status === 200 && hasJsonData(rtdb.body)) {
     findings.push({
       id: 'firebase_rtdb_open',
       severity: 'critical',
@@ -77,8 +111,8 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Firebas
     const res = await request(
       `https://firestore.googleapis.com/v1/projects/${creds.projectId}/databases/(default)/documents/${col}?pageSize=1`,
     );
-    attempts++; if (unreliable(res)) errors++;
-    if (!isErr(res) && res.status === 200 && /"documents"|"name"/.test(res.body)) {
+    attempts++; if (unreliable(res) || (!isErr(res) && res.status >= 300 && res.status < 400)) errors++;
+    if (!isErr(res) && res.status === 200 && hasFirestoreDocs(res.body)) {
       readable.push(col);
     }
   }
@@ -99,8 +133,8 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Firebas
   const bucket = creds.storageBucket ?? `${creds.projectId}.appspot.com`;
   await sleep(rl);
   const storage = await request(`https://firebasestorage.googleapis.com/v0/b/${bucket}/o`);
-  attempts++; if (unreliable(storage)) errors++;
-  if (!isErr(storage) && storage.status === 200 && /"items"|"prefixes"/.test(storage.body)) {
+  attempts++; if (unreliable(storage) || (!isErr(storage) && storage.status >= 300 && storage.status < 400)) errors++;
+  if (!isErr(storage) && storage.status === 200 && hasStorageObjects(storage.body)) {
     findings.push({
       id: 'firebase_storage_open',
       severity: 'critical',

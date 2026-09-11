@@ -3,6 +3,8 @@ import { join } from 'node:path';
 import type { Finding, ScanFile } from './types.js';
 
 export interface VibegateConfig {
+  /** Set when a config file existed but could not be used. */
+  problem?: string;
   /** Suppress by checker id, finding id, or "<id>:<relpath>". */
   ignore: string[];
   /** Suppress any finding whose file path contains one of these substrings. */
@@ -16,14 +18,21 @@ const CONFIG_NAMES = ['easyvibegate.config.json', '.easyvibegaterc.json'];
 export function loadConfig(root: string, explicitPath?: string): VibegateConfig {
   const candidates = explicitPath ? [explicitPath] : CONFIG_NAMES.map((n) => join(root, n));
   for (const p of candidates) {
+    let text: string;
     try {
-      const raw = JSON.parse(readFileSync(p, 'utf8')) as Partial<VibegateConfig>;
+      text = readFileSync(p, 'utf8');
+    } catch {
+      continue; // no such config here — try the next candidate
+    }
+    try {
+      const raw = JSON.parse(text) as Partial<VibegateConfig>;
       return {
         ignore: Array.isArray(raw.ignore) ? raw.ignore : [],
         ignorePaths: Array.isArray(raw.ignorePaths) ? raw.ignorePaths : [],
       };
-    } catch {
-      /* try next candidate */
+    } catch (e) {
+      // The file exists but is broken: say so instead of silently ignoring every rule.
+      return { ...DEFAULT_CONFIG, problem: `${p}: invalid JSON (${e instanceof Error ? e.message : String(e)})` };
     }
   }
   return DEFAULT_CONFIG;
