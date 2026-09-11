@@ -4,9 +4,19 @@ import assert from 'node:assert';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { scanStatic } from '../dist/engine/scan.js';
 import { collectEndpoints, concretePath } from '../dist/engine/endpoints.js';
 import { discoverSupabase } from '../dist/engine/checkers/backend/supabase.js';
+import { setRequestImpl } from '../dist/engine/net/http.js';
+import { checkLiveSite } from '../dist/engine/checkers/live/http-checks.js';
+import { idorDifferential } from '../dist/engine/checkers/live/idor.js';
+import { summarize, exitCodeFor, badgeMarkdown } from '../dist/engine/report.js';
+
+const CLI = new URL('../dist/cli/index.js', import.meta.url).pathname;
+const ok = (status, body = '{"id":1}', headers = {}) => ({ status, ok: status < 300, headers: new Headers(headers), body });
+const ALL_HEADERS = { 'content-security-policy': 'x', 'strict-transport-security': 'x', 'x-frame-options': 'x', 'x-content-type-options': 'x' };
 
 let passed = 0;
 const failures = [];
@@ -130,6 +140,133 @@ await (async () => {
     const k = r.findings.find((f) => f.id === 'openai_key');
     assert.ok(k, 'openai key in yaml should be found');
     assert.strictEqual(k.severity, 'critical');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+console.log('\nverdict policy (one source of truth for CI / JSON / badge / console)');
+
+check('a failed check makes the gate incomplete, exit 3, badge not green', () => {
+  const s = summarize([], [{ id: 'deps', level: 1, status: 'failed' }, { id: 'static:x', level: 0, status: 'completed' }]);
+  assert.strictEqual(s.gate, 'incomplete');
+  assert.strictEqual(exitCodeFor(s), 3);
+  assert.ok(badgeMarkdown(s).includes('incomplete-yellow'), 'badge must not be green');
+});
+check('an unsupported (requested) check also makes the gate incomplete', () => {
+  const s = summarize([], [{ id: 'deps', level: 1, status: 'unsupported' }, { id: 'static:x', level: 0, status: 'completed' }]);
+  assert.strictEqual(s.gate, 'incomplete');
+  assert.strictEqual(exitCodeFor(s), 3);
+});
+check('all checks completed and no findings → pass, exit 0, green badge', () => {
+  const s = summarize([], [{ id: 'static:x', level: 0, status: 'completed' }]);
+  assert.strictEqual(s.gate, 'pass');
+  assert.strictEqual(exitCodeFor(s), 0);
+  assert.ok(badgeMarkdown(s).includes('brightgreen'));
+});
+check('a critical finding wins over incompleteness → fail, exit 2', () => {
+  const s = summarize([{ id: 'x', severity: 'critical', title: '', detail: '', fix: '', checker: 'c', level: 0 }], [{ id: 'deps', level: 1, status: 'failed' }]);
+  assert.strictEqual(s.gate, 'fail');
+  assert.strictEqual(exitCodeFor(s), 2);
+});
+
+console.log('\nlive aggregation (mocked HTTP)');
+
+await (async () => {
+  // Root page fine with all headers; every exposed-file probe times out.
+  setRequestImpl(async (url) => (url.endsWith('/') ? ok(200, '<html>', ALL_HEADERS) : { error: 'ETIMEDOUT' }));
+  const r = await checkLiveSite('https://app.example');
+  setRequestImpl(null);
+  check('live-site: lost file probes are partial, not completed', () => {
+    assert.strictEqual(r.run.status, 'partial', `got ${r.run.status} (${r.run.note})`);
+    assert.strictEqual(r.findings.length, 0);
+  });
+})();
+
+await (async () => {
+  // Single endpoint: A gets data, B gets 500 → learned nothing → not completed.
+  setRequestImpl(async (_url, init) => (String(init?.headers?.Authorization ?? '').includes('tokA') ? ok(200) : ok(500, 'boom')));
+  const r = await idorDifferential('https://app.example', [{ method: 'GET', path: '/api/orders/:id', where: 'x' }], 'tokA', 'tokB', 0);
+  setRequestImpl(null);
+  check('idor: B=500 is inconclusive, never a completed "no leak"', () => {
+    assert.notStrictEqual(r.run.status, 'completed', `got ${r.run.status}`);
+    assert.strictEqual(r.findings.length, 0);
+  });
+})();
+
+await (async () => {
+  // Two endpoints: one properly scoped (A=200/B=403), the other errors for both → partial.
+  setRequestImpl(async (url, init) => {
+    if (url.includes('/broken/')) return { error: 'ECONNRESET' };
+    return String(init?.headers?.Authorization ?? '').includes('tokA') ? ok(200) : ok(403, '{}');
+  });
+  const r = await idorDifferential('https://app.example', [
+    { method: 'GET', path: '/api/orders/:id', where: 'x' },
+    { method: 'GET', path: '/api/broken/:id', where: 'x' },
+  ], 'tokA', 'tokB', 0);
+  setRequestImpl(null);
+  check('idor: one good pair does not hide a lost pair (partial)', () => {
+    assert.strictEqual(r.run.status, 'partial', `got ${r.run.status} (${r.run.note})`);
+  });
+})();
+
+console.log('\nRLS sequences');
+
+await (async () => {
+  const dir = fixture({ 'db/001.sql': 'CREATE TABLE public.orders(id uuid);\nALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\nDROP TABLE public.orders;\nCREATE TABLE public.orders(id uuid);\n' });
+  const r = await scanStatic(dir);
+  check('RLS: in-file order + DROP/recreate → recreated table is flagged', () => {
+    assert.ok(r.findings.some((f) => f.id === 'rls_missing'), 'recreated table without RLS must be flagged');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'db/001.sql': "CREATE TABLE public.orders(id uuid);\nSELECT 'ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;';\n" });
+  const r = await scanStatic(dir);
+  check('RLS: ENABLE inside a string literal does not count', () => {
+    assert.ok(r.findings.some((f) => f.id === 'rls_missing'), 'string literal must not satisfy RLS');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({
+    'db/001.sql': 'CREATE TABLE public.orders(id uuid);\nALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n',
+    'db/002.sql': 'CREATE TABLE IF NOT EXISTS public.orders(id uuid);\n',
+  });
+  const r = await scanStatic(dir);
+  check('RLS: CREATE IF NOT EXISTS on an existing table keeps RLS (no false critical)', () => {
+    const rls = r.findings.filter((f) => f.id === 'rls_missing');
+    assert.strictEqual(rls.length, 0, `unexpected: ${rls.map((f) => f.title).join(', ')}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'db/001.sql': "CREATE TABLE public.orders(id uuid);\n/* ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY */\nSELECT $$ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY$$;\n" });
+  const r = await scanStatic(dir);
+  check('RLS: block comment and dollar-quoted string do not count', () => {
+    assert.ok(r.findings.some((f) => f.id === 'rls_missing'));
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+console.log('\nCLI (real process)');
+
+check('--idor-tokens without --url is rejected (exit 2)', () => {
+  const p = spawnSync(process.execPath, [CLI, '.', '--no-wizard', '--ci', '--format', 'none', '--idor-tokens', 'a,b'], { encoding: 'utf8' });
+  assert.strictEqual(p.status, 2, `stderr: ${p.stderr}`);
+});
+
+await (async () => {
+  const dir = fixture({});
+  const out = join(dir, 'out');
+  const p = spawnSync(process.execPath, [CLI, dir, '--no-wizard', '--ci', '--format', 'json', '--output', out], { encoding: 'utf8' });
+  const json = JSON.parse(readFileSync(join(out, 'report.json'), 'utf8'));
+  check('empty directory: CI exit 3 AND JSON gate=incomplete (not pass/100)', () => {
+    assert.strictEqual(p.status, 3);
+    assert.strictEqual(json.gate, 'incomplete');
+    assert.strictEqual(json.coverage.completed, 0, 'static checks with no files must not count as coverage');
   });
   rmSync(dir, { recursive: true, force: true });
 })();

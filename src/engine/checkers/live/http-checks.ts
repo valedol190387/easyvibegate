@@ -45,9 +45,12 @@ export async function checkLiveSite(appUrl: string): Promise<LiveResult> {
   const base = appUrl.replace(/\/$/, '');
   const findings: Finding[] = [];
 
+  // Track every file probe: a timeout/5xx/429 there is a lost sub-check, not "file absent".
+  let fileErrors = 0;
   for (const probe of EXPOSED) {
     const res = await request(`${base}/${probe.path}`);
-    if (isErr(res) || res.status !== 200) continue;
+    if (isErr(res) || res.status === 429 || res.status >= 500) { fileErrors++; continue; }
+    if (res.status !== 200) continue; // 404 etc. = that file is simply not served
     if (looksLikeHtml(res.body)) continue; // SPA catch-all, not the real file
     if (!probe.signature.test(res.body)) continue;
     findings.push({
@@ -115,11 +118,14 @@ export async function checkLiveSite(appUrl: string): Promise<LiveResult> {
     }
   }
 
-  const status = unreliable(root) ? 'failed' : 'completed';
-  const note = unreliable(root)
-    ? isErr(root) ? `could not reach ${base}/` : `unreliable response (HTTP ${root.status}) from ${base}/`
-    : undefined;
-  return { findings, run: { id: 'live-site', level: 2, status, note } };
+  // Aggregate: the root page AND every file probe count. Losing any sub-check = partial;
+  // losing all of them = failed.
+  const rootBad = unreliable(root);
+  const status = rootBad && fileErrors === EXPOSED.length ? 'failed' : rootBad || fileErrors > 0 ? 'partial' : 'completed';
+  const notes: string[] = [];
+  if (rootBad) notes.push(isErr(root) ? `could not reach ${base}/` : `unreliable response (HTTP ${root.status}) from ${base}/`);
+  if (fileErrors > 0) notes.push(`${fileErrors}/${EXPOSED.length} exposed-file probes errored`);
+  return { findings, run: { id: 'live-site', level: 2, status, note: notes.length ? notes.join('; ') : undefined } };
 }
 
 /** Get individual Set-Cookie header values (undici exposes getSetCookie()). */

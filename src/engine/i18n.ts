@@ -18,6 +18,7 @@ const EN: Dict = {
   'verdict.clean': '✅ No issues found. (Not a guarantee — re-run after changes.)',
   'verdict.incomplete': ' — but some checks could not finish, so this is not the full picture.',
   'verdict.nocov': '⚠️  Nothing was actually verified — no check completed. Point it at a project (and a live URL you own) to get a real result.',
+  'verdict.incompleteGate': '⚠️  Incomplete — no critical findings, but {n} check(s) could not complete. This is NOT a clean result.',
   'cov.line': 'Checks: {ok} ok · {failed} failed · {skipped} skipped',
   // next steps
   'next.title': '── What to do now ──',
@@ -102,6 +103,7 @@ const RU: Dict = {
   'verdict.clean': '✅ Проблем не найдено. (Не гарантия — перезапусти после изменений.)',
   'verdict.incomplete': ' — но часть проверок не завершилась, так что картина неполная.',
   'verdict.nocov': '⚠️  По сути ничего не проверено — ни одна проверка не завершилась. Укажи проект (и свой живой URL), чтобы получить реальный результат.',
+  'verdict.incompleteGate': '⚠️  Неполно — критичного нет, но проверок не завершилось: {n}. Это НЕ «всё чисто».',
   'cov.line': 'Проверки: {ok} выполнено · {failed} с ошибкой · {skipped} пропущено',
   'next.title': '── Что делать дальше ──',
   'next.clean': 'Всё чисто. Перезапускай EasyVibeGate при добавлении фич и перед деплоем.',

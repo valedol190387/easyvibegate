@@ -4,6 +4,9 @@ import type { ScanResult } from './scan.js';
 import { color } from './util/color.js';
 import { t, type Lang } from './i18n.js';
 
+const WEIGHTS: Record<Severity, number> = { critical: 25, warning: 8, info: 2, advisory: 0 };
+const EMOJI: Record<Severity, string> = { critical: '🔴', warning: '🟡', info: '🔵', advisory: '⚪' };
+
 export interface Coverage {
   completed: number;
   partial: number;
@@ -11,9 +14,9 @@ export interface Coverage {
   skipped: number;
   unsupported: number;
   total: number;
-  /** True if a check was attempted but could not finish (failed or partial). */
+  /** A requested check was attempted but could not finish, or is unsupported. */
   incomplete: boolean;
-  /** True if no check actually produced a trustworthy result. */
+  /** No check actually produced a trustworthy result. */
   nothingVerified: boolean;
 }
 
@@ -23,32 +26,45 @@ export function coverage(runs: CheckRun[]): Coverage {
   return {
     ...c,
     total: runs.length,
-    incomplete: c.failed > 0 || c.partial > 0,
+    incomplete: c.failed > 0 || c.partial > 0 || c.unsupported > 0,
     nothingVerified: c.completed + c.partial === 0,
   };
 }
 
-const WEIGHTS: Record<Severity, number> = { critical: 25, warning: 8, info: 2, advisory: 0 };
-const EMOJI: Record<Severity, string> = { critical: '🔴', warning: '🟡', info: '🔵', advisory: '⚪' };
+/**
+ * The single verdict every surface (CI exit, JSON, badge, console, next steps)
+ * derives from. `incomplete` means: no critical finding, but the result cannot
+ * be called clean because a check failed/partially ran/is unsupported, or
+ * nothing was verified at all.
+ */
+export type Gate = 'pass' | 'fail' | 'incomplete';
 
 export interface Summary {
   score: number;
-  gate: 'pass' | 'fail';
+  gate: Gate;
   counts: Record<Severity, number>;
+  coverage: Coverage;
 }
 
-export function summarize(findings: Finding[]): Summary {
+export function summarize(findings: Finding[], runs: CheckRun[] = []): Summary {
   const counts: Record<Severity, number> = { critical: 0, warning: 0, info: 0, advisory: 0 };
   let score = 100;
   for (const f of findings) {
     counts[f.severity]++;
     score -= WEIGHTS[f.severity];
   }
-  return {
-    score: Math.max(0, score),
-    gate: counts.critical > 0 ? 'fail' : 'pass',
-    counts,
-  };
+  const cov = coverage(runs);
+  const gate: Gate =
+    counts.critical > 0 ? 'fail' : cov.incomplete || cov.nothingVerified ? 'incomplete' : 'pass';
+  return { score: Math.max(0, score), gate, counts, coverage: cov };
+}
+
+/** CI exit code from the same policy: 2 critical, 1 warning, 3 incomplete, 0 clean. */
+export function exitCodeFor(summary: Summary): number {
+  if (summary.counts.critical > 0) return 2;
+  if (summary.counts.warning > 0) return 1;
+  if (summary.gate === 'incomplete') return 3;
+  return 0;
 }
 
 export function whereOf(f: Finding): string {
@@ -68,15 +84,12 @@ export function sortFindings(findings: Finding[]): Finding[] {
   );
 }
 
-function badgeColor(summary: Summary): string {
-  if (summary.gate === 'fail') return 'red';
-  if (summary.score >= 90) return 'brightgreen';
-  if (summary.score >= 60) return 'yellow';
-  return 'orange';
-}
-
+/** Badge reflects the gate, never a bare score: an incomplete run is never green. */
 export function badgeMarkdown(summary: Summary): string {
-  return `![EasyVibeGate](https://img.shields.io/badge/EasyVibeGate-${summary.score}%2F100-${badgeColor(summary)})`;
+  if (summary.gate === 'fail') return `![EasyVibeGate](https://img.shields.io/badge/EasyVibeGate-${summary.score}%2F100-red)`;
+  if (summary.gate === 'incomplete') return '![EasyVibeGate](https://img.shields.io/badge/EasyVibeGate-incomplete-yellow)';
+  const c = summary.score >= 90 ? 'brightgreen' : summary.score >= 60 ? 'yellow' : 'orange';
+  return `![EasyVibeGate](https://img.shields.io/badge/EasyVibeGate-${summary.score}%2F100-${c})`;
 }
 
 function stackLine(result: ScanResult): string {
@@ -88,19 +101,20 @@ function stackLine(result: ScanResult): string {
   return parts.join(' · ') || 'unknown stack';
 }
 
+function gateLabel(summary: Summary): string {
+  if (summary.gate === 'fail') return color.red(color.bold('FAIL'));
+  if (summary.gate === 'incomplete') return color.yellow(color.bold('INCOMPLETE'));
+  return color.green(color.bold('PASS'));
+}
+
 export function renderConsole(result: ScanResult, summary: Summary, lang: Lang = 'en'): string {
   const lines: string[] = [];
-  const gateText =
-    summary.gate === 'fail' ? color.red(color.bold('FAIL')) : color.green(color.bold('PASS'));
-
   lines.push('');
   lines.push(`${color.bold('🛡  EasyVibeGate')} ${color.gray(`· ${result.fileCount} ${t(lang, 'console.files')} · ${stackLine(result)}`)}`);
   lines.push('');
 
   const shown = sortFindings(result.findings);
-  if (shown.length === 0) {
-    lines.push(color.green(`  ${t(lang, 'console.none')}`));
-  }
+  if (shown.length === 0) lines.push(color.green(`  ${t(lang, 'console.none')}`));
   for (const f of shown) {
     lines.push(`  ${EMOJI[f.severity]} ${color.bold(f.title)} ${color.gray(whereOf(f))}`);
     lines.push(`     ${color.dim(f.detail)}`);
@@ -110,10 +124,10 @@ export function renderConsole(result: ScanResult, summary: Summary, lang: Lang =
 
   lines.push('');
   const c = summary.counts;
-  lines.push(`  ${color.bold(t(lang, 'console.score'))} ${scoreColor(summary)} ${color.gray('/100')}   ${color.bold(t(lang, 'console.gate'))} ${gateText}`);
+  lines.push(`  ${color.bold(t(lang, 'console.score'))} ${scoreColor(summary)} ${color.gray('/100')}   ${color.bold(t(lang, 'console.gate'))} ${gateLabel(summary)}`);
   lines.push(`  ${EMOJI.critical} ${c.critical}  ${EMOJI.warning} ${c.warning}  ${EMOJI.info} ${c.info}  ${EMOJI.advisory} ${c.advisory}`);
-  const cov = coverage(result.runs);
-  const covLine = t(lang, 'cov.line', { ok: cov.completed, failed: cov.failed, skipped: cov.skipped });
+  const cov = summary.coverage;
+  const covLine = t(lang, 'cov.line', { ok: cov.completed, failed: cov.failed + cov.partial + cov.unsupported, skipped: cov.skipped });
   lines.push(`  ${cov.incomplete ? color.yellow(covLine) : color.gray(covLine)}`);
   lines.push('');
   return lines.join('\n');
@@ -122,35 +136,28 @@ export function renderConsole(result: ScanResult, summary: Summary, lang: Lang =
 function scoreColor(summary: Summary): string {
   const s = String(summary.score);
   if (summary.gate === 'fail') return color.red(s);
-  if (summary.score >= 90) return color.green(s);
-  return color.yellow(s);
+  if (summary.gate === 'incomplete') return color.yellow(s);
+  return summary.score >= 90 ? color.green(s) : color.yellow(s);
 }
 
 /** One plain-language line a non-technical user understands. */
-export function renderVerdict(summary: Summary, runs: CheckRun[] = [], lang: Lang = 'en'): string {
+export function renderVerdict(summary: Summary, lang: Lang = 'en'): string {
   const c = summary.counts;
-  const cov = coverage(runs);
-  if (summary.gate === 'fail') {
-    return color.red(color.bold(`  ${t(lang, 'verdict.fail', { crit: c.critical })}`));
+  if (summary.gate === 'fail') return color.red(color.bold(`  ${t(lang, 'verdict.fail', { crit: c.critical })}`));
+  if (summary.gate === 'incomplete') {
+    const key = summary.coverage.nothingVerified ? 'verdict.nocov' : 'verdict.incompleteGate';
+    return color.yellow(color.bold(`  ${t(lang, key, { n: summary.coverage.failed + summary.coverage.partial + summary.coverage.unsupported })}`));
   }
-  // No critical findings — but only call it clean if something was actually verified.
-  if (cov.nothingVerified && c.warning === 0) {
-    return color.yellow(color.bold(`  ${t(lang, 'verdict.nocov')}`));
-  }
-  const caveat = cov.incomplete ? t(lang, 'verdict.incomplete') : '';
-  if (c.warning > 0) {
-    return color.yellow(color.bold(`  ${t(lang, 'verdict.warn', { warn: c.warning })}${caveat}`));
-  }
-  return color.green(color.bold(`  ${t(lang, 'verdict.clean')}${caveat}`));
+  if (c.warning > 0) return color.yellow(color.bold(`  ${t(lang, 'verdict.warn', { warn: c.warning })}`));
+  return color.green(color.bold(`  ${t(lang, 'verdict.clean')}`));
 }
 
 /** The beginner-facing "what do I do now" block, with an AI-agent handoff. */
-export function renderNextSteps(summary: Summary, reportDir: string, runs: CheckRun[] = [], lang: Lang = 'en'): string {
-  const cov = coverage(runs);
+export function renderNextSteps(summary: Summary, reportDir: string, lang: Lang = 'en'): string {
   const lines: string[] = [];
   lines.push(color.bold(`  ${t(lang, 'next.title')}`));
   if (summary.counts.critical === 0 && summary.counts.warning === 0) {
-    lines.push(`  ${cov.incomplete || cov.nothingVerified ? color.yellow(t(lang, 'next.incompleteClean')) : t(lang, 'next.clean')}`);
+    lines.push(`  ${summary.gate === 'incomplete' ? color.yellow(t(lang, 'next.incompleteClean')) : t(lang, 'next.clean')}`);
     lines.push('');
     return lines.join('\n');
   }
@@ -160,11 +167,9 @@ export function renderNextSteps(summary: Summary, reportDir: string, runs: Check
   lines.push(color.gray(`  ${t(lang, 'next.model1')}`));
   lines.push(color.gray(`  ${t(lang, 'next.model2')}`));
   let n = 3;
-  if (summary.counts.critical > 0) {
-    lines.push(`  ${t(lang, 'next.rotate', { n })}`);
-    n++;
-  }
+  if (summary.counts.critical > 0) { lines.push(`  ${t(lang, 'next.rotate', { n })}`); n++; }
   lines.push(`  ${t(lang, 'next.rerun', { n })}`);
+  if (summary.gate === 'incomplete') lines.push(color.yellow(`  ${t(lang, 'next.incompleteClean')}`));
   lines.push('');
   return lines.join('\n');
 }
@@ -180,7 +185,7 @@ export function renderMarkdown(result: ScanResult, summary: Summary, lang: Lang 
   lines.push(badgeMarkdown(summary));
   lines.push('');
 
-  // Coverage — make failed/partial/skipped checks visible, never hidden behind findings.
+  // Coverage — make failed/partial/skipped/unsupported checks visible.
   const notDone = result.runs.filter((r) => r.status !== 'completed');
   if (notDone.length > 0) {
     lines.push(`## ${t(lang, 'md.checks')}`);
@@ -195,7 +200,6 @@ export function renderMarkdown(result: ScanResult, summary: Summary, lang: Lang 
     lines.push('');
     return lines.join('\n');
   }
-
   for (const sev of SEVERITY_ORDER) {
     const group = shown.filter((f) => f.severity === sev);
     if (group.length === 0) continue;
@@ -209,7 +213,6 @@ export function renderMarkdown(result: ScanResult, summary: Summary, lang: Lang 
     }
     lines.push('');
   }
-
   lines.push('---');
   lines.push(t(lang, 'md.generated'));
   lines.push('');
@@ -222,7 +225,7 @@ export function renderJson(result: ScanResult, summary: Summary): string {
       score: summary.score,
       gate: summary.gate,
       counts: summary.counts,
-      coverage: coverage(result.runs),
+      coverage: summary.coverage,
       fileCount: result.fileCount,
       detection: result.detection,
       runs: result.runs,

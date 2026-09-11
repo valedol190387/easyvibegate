@@ -5,7 +5,7 @@ import { createInterface } from 'node:readline';
 import { runFlow, type ConsentRequest } from '../orchestrator/flow.js';
 import {
   badgeMarkdown,
-  coverage,
+  exitCodeFor,
   renderConsole,
   renderJson,
   renderMarkdown,
@@ -167,6 +167,7 @@ function parseArgs(argv: string[]): Args {
   if (a.appUrl && !httpish(a.appUrl)) a.argErrors.push('--url must start with http:// or https://');
   if (a.supabaseUrl && !httpish(a.supabaseUrl)) a.argErrors.push('--supabase-url must start with http:// or https://');
   if (!!a.supabaseUrl !== !!a.supabaseKey) a.argErrors.push('--supabase-url and --supabase-key must be provided together');
+  if (a.idorTokens && !a.appUrl) a.argErrors.push('--idor-tokens requires --url (the running app to probe)');
   return a;
 }
 
@@ -234,7 +235,7 @@ async function main(): Promise<void> {
     consent,
     log,
   });
-  const summary = summarize(result.findings);
+  const summary = summarize(result.findings, result.runs);
 
   if (!args.ci) process.stdout.write(renderConsole(result, summary, lang) + '\n');
 
@@ -260,18 +261,11 @@ async function main(): Promise<void> {
   }
 
   if (!args.ci) {
-    process.stdout.write(renderVerdict(summary, result.runs, lang) + '\n\n');
-    if (args.format !== 'none') process.stdout.write(renderNextSteps(summary, args.output, result.runs, lang));
+    process.stdout.write(renderVerdict(summary, lang) + '\n\n');
+    if (args.format !== 'none') process.stdout.write(renderNextSteps(summary, args.output, lang));
   }
 
-  if (args.ci) {
-    // 2 = critical, 1 = warning, 3 = a requested check could not complete, 0 = clean.
-    const cov = coverage(result.runs);
-    const incomplete = cov.failed > 0 || cov.partial > 0 || cov.unsupported > 0;
-    process.exit(
-      summary.counts.critical > 0 ? 2 : summary.counts.warning > 0 ? 1 : incomplete ? 3 : 0,
-    );
-  }
+  if (args.ci) process.exit(exitCodeFor(summary)); // 2 critical, 1 warning, 3 incomplete, 0 clean
 }
 
 main().catch((err) => {

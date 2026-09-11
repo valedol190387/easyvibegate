@@ -1,7 +1,7 @@
 import type { CheckRun, Finding } from '../../types.js';
 import type { Endpoint } from '../../endpoints.js';
 import { concretePath } from '../../endpoints.js';
-import { isErr, request, sleep } from '../../net/http.js';
+import { isErr, request, sleep, unreliable } from '../../net/http.js';
 
 export interface IdorResult {
   findings: Finding[];
@@ -19,11 +19,12 @@ function hasData(body: string): boolean {
 
 /**
  * Differential IDOR/BOLA probe. For each object-scoped endpoint, requests the
- * same resource as two different users. If both get 200 with data on the same
- * id, the object is likely not owner-scoped — a candidate IDOR to verify.
- *
- * This is deterministic given two tokens; harvesting real object IDs and
- * judging ambiguous responses is left to the operator or the AI-driven skill.
+ * same resource as two different users and classifies the PAIR:
+ *   - either side unreliable (timeout/5xx/429) → inconclusive, not a verdict
+ *   - both 200 with data                       → candidate cross-user access
+ *   - otherwise                                → a definitive (non-leaking) answer
+ * Harvesting real object IDs and judging ambiguous cases is left to the
+ * operator or the AI-driven skill; the run status says how much was proven.
  */
 export async function idorDifferential(
   appUrl: string,
@@ -35,37 +36,32 @@ export async function idorDifferential(
   const base = appUrl.replace(/\/$/, '');
   const findings: Finding[] = [];
 
-  const idEndpoints = endpoints.filter(
-    (e) => (e.method === 'GET' || e.method === 'ANY') && /(:[A-Za-z0-9_]+|\[[^\]]+\]|\{[^}]+\})/.test(e.path),
-  ).slice(0, 40);
-
+  const idEndpoints = endpoints
+    .filter((e) => (e.method === 'GET' || e.method === 'ANY') && /(:[A-Za-z0-9_]+|\[[^\]]+\]|\{[^}]+\})/.test(e.path))
+    .slice(0, 40);
   if (idEndpoints.length === 0) {
-    return {
-      findings: [],
-      run: { id: 'idor', level: 2, status: 'skipped', note: 'no object-scoped (id) endpoints found' },
-    };
+    return { findings, run: { id: 'idor', level: 2, status: 'skipped', note: 'no object-scoped (id) endpoints found' } };
   }
 
-  let probed = 0;
-  let usableResponses = 0;
+  let inconclusive = 0; // a side timed out / 5xx / 429 — we learned nothing
+  let evaluated = 0; // both sides answered reliably
+  let dataSeen = 0; // at least one side returned actual data (the guessed id exists)
+
   for (const e of idEndpoints) {
     const path = concretePath(e.path).replace(/^\/?/, '/');
     await sleep(rateLimitMs);
     const a = await request(base + path, { headers: bearer(tokenA) });
     await sleep(rateLimitMs);
     const b = await request(base + path, { headers: bearer(tokenB) });
-    if (isErr(a) || isErr(b)) continue;
-    probed++;
+
+    if (unreliable(a) || unreliable(b) || isErr(a) || isErr(b)) { inconclusive++; continue; }
+    evaluated++;
 
     const aOk = a.status === 200 && hasData(a.body);
     const bOk = b.status === 200 && hasData(b.body);
-    if (aOk || bOk) usableResponses++;
+    if (aOk || bOk) dataSeen++;
 
     if (aOk && bOk) {
-      // Both users getting data on the same id is a *candidate* IDOR, but it is
-      // also exactly what a legitimately public/shared resource looks like. We
-      // cannot confirm ownership without knowing whose object this id is, so we
-      // never fail the gate on it — report as a warning to verify.
       const identical = a.body === b.body;
       findings.push({
         id: 'idor_cross_user',
@@ -82,21 +78,15 @@ export async function idorDifferential(
     }
   }
 
-  // If the probes never produced a usable 200 (e.g. every id was a UUID and the
-  // guessed id=1 404'd), the run is inconclusive, not "clean".
-  if (probed === 0) {
-    return { findings, run: { id: 'idor', level: 2, status: 'failed', note: 'all requests errored' } };
+  const total = idEndpoints.length;
+  if (evaluated === 0) {
+    return { findings, run: { id: 'idor', level: 2, status: 'failed', note: `all ${total} pair(s) were inconclusive (timeout/5xx/429)` } };
   }
-  if (usableResponses === 0) {
-    return {
-      findings,
-      run: {
-        id: 'idor',
-        level: 2,
-        status: 'partial',
-        note: 'no endpoint returned data for the guessed id — provide real object ids to confirm ownership',
-      },
-    };
+  if (inconclusive > 0) {
+    return { findings, run: { id: 'idor', level: 2, status: 'partial', note: `${inconclusive}/${total} pair(s) inconclusive (timeout/5xx/429)` } };
+  }
+  if (dataSeen === 0) {
+    return { findings, run: { id: 'idor', level: 2, status: 'partial', note: 'no endpoint returned data for the guessed id — provide real object ids to confirm ownership' } };
   }
   return { findings, run: { id: 'idor', level: 2, status: 'completed' } };
 }

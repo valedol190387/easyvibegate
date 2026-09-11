@@ -44,12 +44,10 @@ async function readCapped(res: Response, max: number): Promise<string> {
   return Buffer.concat(chunks).subarray(0, max).toString('utf8');
 }
 
-/** fetch() with a hard timeout and no throw — network errors become { error }. */
-export async function request(
-  url: string,
-  init: RequestInit = {},
-  timeoutMs = 8000,
-): Promise<HttpResult> {
+export type RequestFn = (url: string, init?: RequestInit, timeoutMs?: number) => Promise<HttpResult>;
+
+/** The real network implementation: fetch() with a hard timeout and no throw. */
+async function realRequest(url: string, init: RequestInit = {}, timeoutMs = 8000): Promise<HttpResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -62,6 +60,18 @@ export async function request(
   } finally {
     clearTimeout(timer);
   }
+}
+
+let impl: RequestFn = realRequest;
+
+/** All probes go through here, so tests can swap the network for a fake. */
+export function request(url: string, init: RequestInit = {}, timeoutMs = 8000): Promise<HttpResult> {
+  return impl(url, init, timeoutMs);
+}
+
+/** Test hook: replace the network implementation (pass null to restore). */
+export function setRequestImpl(fn: RequestFn | null): void {
+  impl = fn ?? realRequest;
 }
 
 /**

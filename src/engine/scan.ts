@@ -29,9 +29,14 @@ export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<
   const runs: CheckRun[] = [];
 
   // Zero scannable files means nothing was actually reviewed — record it as a
-  // failed precondition so the result is never shown as a clean 100/100.
+  // failed precondition, and mark the static checkers as skipped (they had no
+  // input), so the result is never shown as a clean, well-covered 100/100.
   if (files.length === 0) {
     runs.push({ id: 'walk', level: 0, status: 'failed', note: 'no scannable files found at this path' });
+    for (const checker of staticCheckers) {
+      runs.push({ id: `static:${checker.id}`, level: 0, status: 'skipped', note: 'no files to check' });
+    }
+    return { root, detection, findings, fileCount: 0, files, runs };
   }
 
   for (const checker of staticCheckers) {

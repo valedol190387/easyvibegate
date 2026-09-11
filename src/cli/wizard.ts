@@ -60,7 +60,7 @@ export async function runWizard(args: WizardArgs): Promise<void> {
   // Step 1 — static code review (always, safe).
   w(`  ${color.bold(t(lang, 'wiz.step1'))}${color.gray(t(lang, 'wiz.step1hint'))}`);
   const staticResult = await scanStatic(root, { configPath: args.config });
-  const s0 = summarize(staticResult.findings);
+  const s0 = summarize(staticResult.findings, staticResult.runs);
   w(color.gray(`  ${t(lang, 'wiz.step1result', { files: staticResult.fileCount, crit: s0.counts.critical, warn: s0.counts.warning })}`));
   w();
 
@@ -113,10 +113,10 @@ export async function runWizard(args: WizardArgs): Promise<void> {
     consent,
     log,
   });
-  const summary = summarize(result.findings);
+  const summary = summarize(result.findings, result.runs);
 
   w(renderConsole(result, summary, lang));
-  w(renderVerdict(summary, result.runs, lang));
+  w(renderVerdict(summary, lang));
   w();
 
   mkdirSync(args.output, { recursive: true });
@@ -124,7 +124,7 @@ export async function runWizard(args: WizardArgs): Promise<void> {
   writeFileSync(join(args.output, 'report.json'), renderJson(result, summary), 'utf8');
   writeFileSync(join(args.output, 'ai-fix-prompt.md'), buildAiFixPrompt(result, summary, lang), 'utf8');
 
-  w(renderNextSteps(summary, args.output, result.runs, lang));
+  w(renderNextSteps(summary, args.output, lang));
   w(color.gray(`  ${t(lang, 'next.fullReport', { path: `${args.output}/report.md` })}`));
   if (summary.counts.critical > 0 || summary.counts.warning > 0) {
     w(color.gray(`  ${t(lang, 'next.badge', { badge: badgeMarkdown(summary) })}`));

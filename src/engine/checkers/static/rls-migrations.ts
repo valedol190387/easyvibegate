@@ -3,8 +3,9 @@ import { lineAt } from '../../util/text.js';
 
 const IDENT = '(?:"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_$]*)';
 const QUALIFIED = `(?:(${IDENT})\\s*\\.\\s*)?(${IDENT})`;
-const CREATE_TABLE = new RegExp(`create\\s+table\\s+(?:if\\s+not\\s+exists\\s+)?${QUALIFIED}`, 'gi');
+const CREATE_TABLE = new RegExp(`create\\s+table\\s+(if\\s+not\\s+exists\\s+)?${QUALIFIED}`, 'gi');
 const RLS_STMT = new RegExp(`alter\\s+table\\s+(?:only\\s+)?${QUALIFIED}\\s+(enable|disable)\\s+row\\s+level\\s+security`, 'gi');
+const DROP_TABLE = new RegExp(`drop\\s+table\\s+(?:if\\s+exists\\s+)?${QUALIFIED}`, 'gi');
 
 /** Normalize one SQL identifier: quoted keeps case, unquoted folds to lowercase. */
 function normIdent(raw: string): string {
@@ -12,34 +13,76 @@ function normIdent(raw: string): string {
   if (raw.startsWith('`') && raw.endsWith('`')) return raw.slice(1, -1);
   return raw.toLowerCase();
 }
-function keyOf(schema: string | undefined, table: string): string {
-  return `${schema ? normIdent(schema) : 'public'}.${normIdent(table)}`;
-}
-function displayOf(schema: string | undefined, table: string): string {
-  return schema ? `${schema}.${table}` : table;
-}
+const keyOf = (schema: string | undefined, table: string) => `${schema ? normIdent(schema) : 'public'}.${normIdent(table)}`;
+const displayOf = (schema: string | undefined, table: string) => (schema ? `${schema}.${table}` : table);
 
-/** Replace SQL comments with equal-length blanks so match offsets stay accurate. */
-function maskComments(sql: string): string {
-  return sql
-    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
-    .replace(/--[^\n]*/g, (m) => ' '.repeat(m.length));
+/**
+ * Blank out comments and string literals (keeping newlines and offsets) so that
+ * SQL inside a string — e.g. SELECT 'ALTER TABLE x ENABLE ROW LEVEL SECURITY' —
+ * or inside a comment is never mistaken for an executed statement.
+ * Handles -- and block comments, '...' with '' escapes (and E'...'), and
+ * $$ / $tag$ dollar-quoted strings. Double-quoted identifiers are kept.
+ */
+export function maskSql(sql: string): string {
+  const out = sql.split('');
+  const n = sql.length;
+  const blank = (from: number, to: number) => {
+    for (let k = from; k < to && k < n; k++) if (out[k] !== '\n') out[k] = ' ';
+  };
+  let i = 0;
+  while (i < n) {
+    const ch = sql[i];
+    const next = sql[i + 1];
+    if (ch === '-' && next === '-') {
+      let j = i;
+      while (j < n && sql[j] !== '\n') j++;
+      blank(i, j); i = j; continue;
+    }
+    if (ch === '/' && next === '*') {
+      const close = sql.indexOf('*/', i + 2);
+      const end = close === -1 ? n : close + 2;
+      blank(i, end); i = end; continue;
+    }
+    if (ch === "'") {
+      let j = i + 1;
+      while (j < n) {
+        if (sql[j] === "'") { if (sql[j + 1] === "'") { j += 2; continue; } break; }
+        j++;
+      }
+      const end = Math.min(j + 1, n);
+      blank(i, end); i = end; continue;
+    }
+    if (ch === '$') {
+      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i, i + 64));
+      if (m) {
+        const tag = m[0];
+        const close = sql.indexOf(tag, i + tag.length);
+        const end = close === -1 ? n : close + tag.length;
+        blank(i, end); i = end; continue;
+      }
+    }
+    i++;
+  }
+  return out.join('');
 }
 
 interface Event {
+  kind: 'create' | 'enable' | 'disable' | 'drop';
   key: string;
-  kind: 'create' | 'enable' | 'disable';
+  ifNotExists: boolean;
   file: string;
   line: number;
   display: string;
-  order: number;
+  fileIdx: number;
+  offset: number;
 }
 
 /**
- * Flags each table CREATEd in a migration whose latest RLS state is not enabled.
- * Keys by (schema, table); processes CREATE / ENABLE / DISABLE in apply order
- * (files sorted by name, then by position); ignores comments; handles quoted
- * and schema-qualified identifiers.
+ * Flags each table whose latest state after replaying the migrations is
+ * "created and RLS not enabled". Migrations are replayed in apply order
+ * (files by name, statements by offset); CREATE / ENABLE / DISABLE / DROP are
+ * all modeled; CREATE IF NOT EXISTS on an existing table is a no-op; comments
+ * and string literals are ignored; quoted and schema-qualified names work.
  */
 export const rlsMigrationsChecker: Checker = {
   id: 'rls-migrations',
@@ -50,26 +93,30 @@ export const rlsMigrationsChecker: Checker = {
     if (sqlFiles.length === 0) return [];
 
     const events: Event[] = [];
-    let order = 0;
-    for (const f of sqlFiles) {
-      const masked = maskComments(f.content);
-      for (const m of masked.matchAll(CREATE_TABLE)) {
-        events.push({ key: keyOf(m[1], m[2] ?? ''), kind: 'create', file: f.rel, line: lineAt(f.content, m.index ?? 0), display: displayOf(m[1], m[2] ?? ''), order: order++ });
-      }
-      for (const m of masked.matchAll(RLS_STMT)) {
-        const kind = (m[3] ?? '').toLowerCase() === 'disable' ? 'disable' : 'enable';
-        events.push({ key: keyOf(m[1], m[2] ?? ''), kind, file: f.rel, line: lineAt(f.content, m.index ?? 0), display: displayOf(m[1], m[2] ?? ''), order: order++ });
-      }
-    }
-    events.sort((a, b) => a.order - b.order);
+    sqlFiles.forEach((f, fileIdx) => {
+      const masked = maskSql(f.content);
+      const push = (kind: Event['kind'], schema: string | undefined, table: string, offset: number, ifNotExists = false) =>
+        events.push({ kind, key: keyOf(schema, table), ifNotExists, file: f.rel, line: lineAt(f.content, offset), display: displayOf(schema, table), fileIdx, offset });
+      for (const m of masked.matchAll(CREATE_TABLE)) push('create', m[2], m[3] ?? '', m.index ?? 0, !!m[1]);
+      for (const m of masked.matchAll(RLS_STMT)) push((m[3] ?? '').toLowerCase() === 'disable' ? 'disable' : 'enable', m[1], m[2] ?? '', m.index ?? 0);
+      for (const m of masked.matchAll(DROP_TABLE)) push('drop', m[1], m[2] ?? '', m.index ?? 0);
+    });
+    // True apply order: by migration file, then by statement position in the file.
+    events.sort((a, b) => a.fileIdx - b.fileIdx || a.offset - b.offset);
 
-    // Replay in apply order; last write wins for RLS state.
-    const state = new Map<string, { created: boolean; enabled: boolean; file: string; line: number; display: string }>();
+    interface State { created: boolean; enabled: boolean; file: string; line: number; display: string }
+    const state = new Map<string, State>();
     for (const e of events) {
       const cur = state.get(e.key) ?? { created: false, enabled: false, file: e.file, line: e.line, display: e.display };
-      if (e.kind === 'create') { cur.created = true; cur.enabled = false; cur.file = e.file; cur.line = e.line; cur.display = e.display; }
-      else if (e.kind === 'enable') cur.enabled = true;
-      else cur.enabled = false;
+      switch (e.kind) {
+        case 'create':
+          if (e.ifNotExists && cur.created) break; // existing table: no-op, keep RLS state
+          cur.created = true; cur.enabled = false; cur.file = e.file; cur.line = e.line; cur.display = e.display;
+          break;
+        case 'enable': cur.enabled = true; break;
+        case 'disable': cur.enabled = false; break;
+        case 'drop': cur.created = false; cur.enabled = false; break;
+      }
       state.set(e.key, cur);
     }
 
