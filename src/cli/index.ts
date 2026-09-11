@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { runFlow, type ConsentRequest } from '../orchestrator/flow.js';
@@ -38,6 +38,7 @@ interface Args {
   lang?: string;
   idorTokens?: [string, string];
   badIdorTokens: boolean;
+  noReport: boolean;
   unknown: string[];
   argErrors: string[];
   help: boolean;
@@ -57,7 +58,7 @@ A fix plan (ai-fix-prompt.md) is always written next to the report.
 Options:
   -o, --output <dir>     Report directory (default: <project>/easyvibegate-report)
   -f, --format <fmt>     all | md | json | none (default: all)
-      --ci               Quiet; exit non-zero on findings (2 critical, 1 warning)
+      --ci               Non-interactive: no wizard, no prompts, quiet output
   -c, --config <file>    Path to a easyvibegate config JSON
 
   Level 1:
@@ -78,6 +79,7 @@ Options:
   -h, --help             Show help
   -v, --version          Show version
 
+Exit codes (every mode): 2 = critical, 1 = warnings, 3 = a check did not complete, 0 = clean.
 Ethics: the live probe sends real requests. Only run it against systems you own.
 `;
 
@@ -92,12 +94,14 @@ function parseArgs(argv: string[]): Args {
     noWizard: false,
     wizard: false,
     badIdorTokens: false,
+    noReport: false,
     unknown: [],
     argErrors: [],
     help: false,
     version: false,
   };
   let sawPath = false;
+  let endOfFlags = false;
   let i = 0;
   // Read a required value; error if it's missing or looks like another flag.
   const need = (name: string): string | undefined => {
@@ -109,19 +113,24 @@ function parseArgs(argv: string[]): Args {
 
   for (; i < argv.length; i++) {
     const arg = argv[i]!;
+    if (endOfFlags) {
+      if (!sawPath) { a.path = arg; sawPath = true; } else a.argErrors.push(`unexpected extra path "${arg}"`);
+      continue;
+    }
+    if (arg === '--') { endOfFlags = true; continue; }
     switch (arg) {
       case '-h': case '--help': a.help = true; break;
       case '-v': case '--version': a.version = true; break;
       case '--ci': a.ci = true; break;
       case '-o': case '--output': a.output = need('--output') ?? a.output; break;
       case '-f': case '--format': {
-        const v = need('--format');
+        const v = need('--format')?.toLowerCase();
         if (v === undefined) break;
         if (v === 'all' || v === 'md' || v === 'json' || v === 'none') a.format = v;
         else a.argErrors.push(`--format must be one of all|md|json|none (got "${v}")`);
         break;
       }
-      case '--no-report': a.format = 'none'; break;
+      case '--no-report': a.noReport = true; break;
       case '-c': case '--config': a.config = need('--config'); break;
       case '--url': a.appUrl = need('--url'); break;
       case '--supabase-url': a.supabaseUrl = need('--supabase-url'); break;
@@ -132,7 +141,7 @@ function parseArgs(argv: string[]): Args {
       case '--no-wizard': case '--scan': a.noWizard = true; break;
       case '--wizard': a.wizard = true; break;
       case '--lang': {
-        const v = need('--lang');
+        const v = need('--lang')?.toLowerCase();
         if (v === undefined) break;
         if (v === 'ru' || v === 'en') a.lang = v;
         else a.argErrors.push(`--lang must be ru or en (got "${v}")`);
@@ -149,10 +158,14 @@ function parseArgs(argv: string[]): Args {
       default:
         if (arg.startsWith('-')) a.unknown.push(arg);
         else if (!sawPath) { a.path = arg; sawPath = true; }
+        else a.argErrors.push(`unexpected extra path "${arg}" — scan one project at a time`);
     }
   }
 
   // Cross-option validation.
+  if (a.noReport) a.format = 'none'; // wins regardless of flag order
+  if (a.wizard && a.noWizard) a.argErrors.push('--wizard and --no-wizard cannot be combined');
+  if (a.output !== undefined && a.output.trim() === '') a.argErrors.push('--output needs a directory path');
   const httpish = (u: string) => /^https?:\/\//i.test(u);
   if (a.appUrl && !httpish(a.appUrl)) a.argErrors.push('--url must start with http:// or https://');
   if (a.supabaseUrl && !httpish(a.supabaseUrl)) a.argErrors.push('--supabase-url must start with http:// or https://');
@@ -163,7 +176,12 @@ function parseArgs(argv: string[]): Args {
 
 function ask(question: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stderr });
-  return new Promise((res) => rl.question(question, (ans) => { rl.close(); res(ans); }));
+  return new Promise((res) => {
+    let done = false;
+    const finish = (v: string) => { if (!done) { done = true; rl.close(); res(v); } };
+    rl.question(question, finish);
+    rl.once('close', () => finish('')); // Ctrl-D / EOF = "no", never a silent hang
+  });
 }
 
 async function main(): Promise<void> {
@@ -208,8 +226,8 @@ async function main(): Promise<void> {
 
   // Use the friendly wizard when a human runs it in a terminal without
   // automation flags; --wizard forces it. Either way the pipeline below is shared.
-  const powerFlags = autoYes || !!args.supabaseUrl;
-  const useWizard = args.wizard || (!args.noWizard && !args.ci && !powerFlags && !!process.stdin.isTTY);
+  // --ci is a non-interactive contract: never ask questions there.
+  const useWizard = !args.ci && (args.wizard || (!args.noWizard && !autoYes && !!process.stdin.isTTY));
 
   let result;
   if (useWizard) {
@@ -220,6 +238,9 @@ async function main(): Promise<void> {
       appUrl: args.appUrl,
       deps: args.deps,
       idorTokens: args.idorTokens,
+      supabaseUrl: args.supabaseUrl,
+      supabaseKey: args.supabaseKey,
+      autoYes,
     });
   } else {
     const interactive = !!process.stdin.isTTY && !args.ci && !autoYes;
@@ -252,7 +273,11 @@ async function main(): Promise<void> {
   if (!args.ci) process.stdout.write(renderConsole(result, summary, lang) + '\n');
 
   if (args.format !== 'none') {
-    mkdirSync(outDir, { recursive: true });
+    const problem = prepareOutputDir(outDir);
+    if (problem) {
+      process.stderr.write(`easyvibegate: --output ${outDir}: ${problem}\n`);
+      process.exit(2);
+    }
     const written: string[] = [];
     if (args.format === 'all' || args.format === 'md') {
       const p = join(outDir, 'report.md');
@@ -277,12 +302,30 @@ async function main(): Promise<void> {
     if (args.format !== 'none') process.stdout.write(renderNextSteps(summary, outDir, lang));
   }
 
-  if (args.ci) process.exit(exitCodeFor(summary)); // 2 critical, 1 warning, 3 incomplete, 0 clean
+  // Same contract in every mode: 2 critical, 1 warning, 3 incomplete, 0 clean.
+  process.exit(exitCodeFor(summary));
+}
+
+/** Create the report dir and clear our own stale files, or explain why we cannot. */
+function prepareOutputDir(dir: string): string | null {
+  try {
+    if (existsSync(dir) && !statSync(dir).isDirectory()) return 'exists and is not a directory';
+    mkdirSync(dir, { recursive: true });
+    // Old report.md next to a fresh report.json told two different stories.
+    for (const name of ['report.md', 'report.json', 'ai-fix-prompt.md']) {
+      const p = join(dir, name);
+      if (existsSync(p)) rmSync(p, { force: true });
+    }
+    return null;
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
+  }
 }
 
 /** Returns a human message when an explicitly given config is unusable. */
 function validateConfigFile(path: string): string | null {
   if (!existsSync(path)) return 'file not found';
+  if (!statSync(path).isFile()) return 'not a file';
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(path, 'utf8'));
@@ -291,11 +334,15 @@ function validateConfigFile(path: string): string | null {
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return 'must be a JSON object';
   const cfg = parsed as Record<string, unknown>;
-  for (const key of ['ignore', 'ignorePaths']) {
+  const known = ['ignore', 'ignorePaths'];
+  for (const key of known) {
     const v = cfg[key];
     if (v === undefined) continue;
     if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) return `"${key}" must be an array of strings`;
   }
+  // A typo like "ignorePath" would silently do nothing — say so instead.
+  const unknown = Object.keys(cfg).filter((k) => !known.includes(k));
+  if (unknown.length) return `unknown key(s): ${unknown.join(', ')} (expected ${known.join(', ')})`;
   return null;
 }
 

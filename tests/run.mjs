@@ -305,7 +305,7 @@ await (async () => {
 await (async () => {
   const dir = fixture(CRITICAL_FIXTURE);
   // Answer: deps=n, url=127.0.0.1:1 (refused instantly, proves the URL reached the flow).
-  runCli([dir, '--wizard', '--format', 'json'], { input: 'n\nhttp://127.0.0.1:1\n' });
+  runCli([dir, '--wizard', '--format', 'json'], { input: 'n\nhttp://127.0.0.1:1\ny\n' });
   const json = JSON.parse(readFileSync(join(dir, 'easyvibegate-report', 'report.json'), 'utf8'));
   check('piped wizard answers are not lost (URL reaches the live probe)', () => {
     assert.ok(json.runs.some((r) => r.id === 'live-site'), `runs: ${json.runs.map((r) => r.id).join(',')}`);
@@ -574,6 +574,123 @@ await (async () => {
   check('a cookie set on the login redirect hop is still inspected', () => {
     assert.ok(r.findings.some((f) => f.id === 'cookie_flags'), r.findings.map((f) => f.id).join(','));
   });
+})();
+
+console.log('\nCLI audit regressions (round 3)');
+
+check('warning-only project: verdict, JSON gate, badge and exit code all agree', () => {
+  const s = summarize([{ id: 'w', severity: 'warning', title: '', detail: '', fix: '', checker: 'c', level: 0 }], [{ id: 'static:x', level: 0, status: 'completed' }]);
+  assert.strictEqual(s.gate, 'warn');
+  assert.strictEqual(exitCodeFor(s), 1);
+  assert.ok(!badgeMarkdown(s).includes('brightgreen'), 'a warning badge must not be green');
+});
+
+check('normalizeUrl: localhost keeps http, public host gets https', () => {
+  assert.strictEqual(normalizeUrl('localhost:3000'), 'http://localhost:3000');
+  assert.strictEqual(normalizeUrl('127.0.0.1:8080'), 'http://127.0.0.1:8080');
+  assert.strictEqual(normalizeUrl('myapp.com'), 'https://myapp.com');
+});
+
+await (async () => {
+  const dir = fixture(CRITICAL_FIXTURE);
+  const p = runCli([dir, '--no-wizard', '--format', 'none']); // no --ci
+  check('a FAIL verdict exits non-zero even without --ci', () => {
+    assert.strictEqual(p.status, 2, `got ${p.status}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture(CRITICAL_FIXTURE);
+  const p = runCli([dir, '--wizard', '--format', 'none'], { input: '' }); // immediate EOF
+  check('EOF in the wizard does not crash — it finishes and reports', () => {
+    assert.notStrictEqual(p.status, 1, `crashed: ${p.stderr.slice(0, 200)}`);
+    assert.ok(!/ERR_USE_AFTER_CLOSE/.test(p.stderr), p.stderr.slice(0, 200));
+    assert.strictEqual(p.status, 2, 'the critical finding must still drive the exit code');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture(CRITICAL_FIXTURE);
+  const p = runCli([dir, '--no-wizard', '--url', 'http://127.0.0.1:1', '--format', 'none'], { input: '' });
+  check('EOF at the consent prompt still reports (no silent exit 0)', () => {
+    assert.strictEqual(p.status, 2, `got ${p.status}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture(CRITICAL_FIXTURE);
+  const clean = fixture({ 'ok.ts': 'const a = 1;\n' });
+  const p = runCli([clean, dir, '--no-wizard', '--format', 'none']);
+  check('a second positional path is rejected, not silently ignored', () => {
+    assert.strictEqual(p.status, 2, `got ${p.status}: ${p.stdout.slice(0, 120)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(clean, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture(CRITICAL_FIXTURE);
+  const out = join(dir, 'out');
+  runCli([dir, '--no-wizard', '--format', 'all', '-o', out]);
+  const cleanDir = fixture({ 'ok.ts': 'const a = 1;\n' });
+  runCli([cleanDir, '--no-wizard', '--format', 'json', '-o', out]);
+  check('stale report.md from a previous run is not left next to a fresh report.json', () => {
+    assert.ok(!existsSync(join(out, 'report.md')), 'the old markdown report must be cleared');
+  });
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(cleanDir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'ok.ts': 'const a = 1;\n', 'f.txt': 'hi' });
+  const p = runCli([dir, '--no-wizard', '-o', join(dir, 'f.txt')]);
+  check('--output pointing at a file fails cleanly (exit 2, no stack trace)', () => {
+    assert.strictEqual(p.status, 2, `got ${p.status}`);
+    assert.ok(!/at mkdirSync|node:fs:/.test(p.stderr), p.stderr.slice(0, 200));
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'ok.ts': 'const a = 1;\n', 'c.json': '{"ignorePath":["x"]}' });
+  const p = runCli([dir, '--no-wizard', '--format', 'none', '--config', join(dir, 'c.json')]);
+  check('a misspelled config key is rejected instead of doing nothing', () => {
+    assert.strictEqual(p.status, 2, `got ${p.status}`);
+    assert.match(p.stderr, /unknown key/i);
+  });
+  const p2 = runCli([dir, '--no-wizard', '--format', 'none', '--config', dir]);
+  check('--config pointing at a directory says "not a file"', () => {
+    assert.match(p2.stderr, /not a file/i);
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture({ 'ok.ts': 'const a = 1;\n' });
+  check('--lang RU / --format All are accepted case-insensitively', () => {
+    assert.notStrictEqual(runCli([dir, '--no-wizard', '--format', 'None', '--lang', 'RU']).status, 2);
+  });
+  check('--no-report wins regardless of flag order', () => {
+    runCli([dir, '--no-wizard', '--no-report', '--format', 'json']);
+    assert.ok(!existsSync(join(dir, 'easyvibegate-report')), 'no report dir should be created');
+  });
+  check('--wizard together with --no-wizard is rejected', () => {
+    assert.strictEqual(runCli([dir, '--wizard', '--no-wizard']).status, 2);
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture(CRITICAL_FIXTURE);
+  const p = runCli([dir, '--wizard', '--ci', '--format', 'none'], { input: '' });
+  check('--ci never runs the interactive wizard', () => {
+    assert.ok(!/Step 1|Шаг 1/.test(p.stdout), `wizard ran under --ci: ${p.stdout.slice(0, 120)}`);
+    assert.strictEqual(p.status, 2);
+  });
+  rmSync(dir, { recursive: true, force: true });
 })();
 
 console.log(`\n${passed} passed, ${failures.length} failed`);

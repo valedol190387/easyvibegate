@@ -89,7 +89,7 @@ npm / pnpm / yarn audit. A registry error is reported as "failed", never "clean"
 - **One gate policy everywhere** (CI, JSON, badge, console): `fail` — a critical finding; `incomplete` — nothing critical, but a check failed / ran partially / is unsupported; `pass` — everything ran and is clean.
 - **Score:** 0–100. An `incomplete` run is **never a green badge**.
 - **Coverage line:** "Checks: N ok · M failed · K skipped".
-- **Exit codes (`--ci`):** `2` critical, `1` warnings, `3` a check did not complete, `0` clean.
+- **Exit codes (every mode, not just `--ci`):** `2` critical, `1` warnings, `3` a check did not complete, `0` clean.
 - Reports record the scanned path, version and timestamp, so reports from different projects never get mixed up.
 
 ## Suppressing noise

@@ -16,19 +16,28 @@ export interface WizardArgs {
   appUrl?: string;
   deps?: boolean;
   idorTokens?: [string, string];
+  supabaseUrl?: string;
+  supabaseKey?: string;
+  /** --i-own-this / --yes: ownership already asserted, don't ask again. */
+  autoYes?: boolean;
 }
 
-/** Normalize what a person types as a URL. Returns null if it cannot be one. */
+/**
+ * Normalize what a person types as a URL. Returns null if it cannot be one.
+ * Loopback and private hosts default to http:// — a dev server is almost never
+ * https, and silently guessing https makes the whole probe fail.
+ */
 export function normalizeUrl(input: string): string | null {
   const raw = input.trim();
   if (raw === '' || /\s/.test(raw)) return null;
-  const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  const hostPart = raw.replace(/^[a-z]+:\/\//i, '').split(/[/:?#]/)[0] ?? '';
+  const isLocal = /^(localhost|127(\.\d+){3}|0\.0\.0\.0|\[::1\]|10(\.\d+){3}|192\.168(\.\d+){2}|172\.(1[6-9]|2\d|3[01])(\.\d+){2})$/i.test(hostPart);
+  const withScheme = /^https?:\/\//i.test(raw) ? raw : `${isLocal ? 'http' : 'https'}://${raw}`;
   try {
     const u = new URL(withScheme);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
     const host = u.hostname;
-    // A real host: localhost, an IP/bracketed IPv6, or something.with.a.dot
-    if (!(host === 'localhost' || host.startsWith('[') || /^[^.]+\.[^.]+/.test(host))) return null;
+    if (!(host === 'localhost' || host.startsWith('[') || /^[^.]+\.[^.]+/.test(host) || /^\d+(\.\d+){3}$/.test(host))) return null;
     return u.toString().replace(/\/$/, '');
   } catch {
     return null;
@@ -45,8 +54,7 @@ async function readPipedLines(): Promise<string[]> {
 /**
  * The beginner-friendly guided run: plain questions, plain answers.
  * It only gathers input and runs the checks — writing reports, the verdict and
- * the exit code stay in the CLI's single shared pipeline, so `--ci` / `--format`
- * behave identically with and without the wizard.
+ * the exit code stay in the CLI's single shared pipeline.
  */
 export async function runWizard(args: WizardArgs): Promise<ScanResult> {
   const root = resolve(args.path);
@@ -58,23 +66,40 @@ export async function runWizard(args: WizardArgs): Promise<ScanResult> {
   let pipeIdx = 0;
 
   const rl = tty ? createInterface({ input: process.stdin, output: process.stdout }) : null;
-  const ask = (question: string): Promise<string> => {
+  let inputEnded = false;
+  rl?.on('close', () => { inputEnded = true; });
+
+  /** Returns null when there is no answer left (EOF / Ctrl-D / exhausted pipe). */
+  const ask = (question: string): Promise<string | null> => {
+    if (inputEnded) return Promise.resolve(null);
     if (!rl) {
+      if (pipeIdx >= piped.length) { inputEnded = true; return Promise.resolve(null); }
       const line = piped[pipeIdx++] ?? '';
       process.stdout.write(question + line + '\n');
       return Promise.resolve(line.trim());
     }
     return new Promise((res) => {
       let done = false;
-      const finish = (v: string) => { if (!done) { done = true; res(v.trim()); } };
-      rl.question(question, finish);
-      rl.once('close', () => finish(''));
+      const finish = (v: string | null) => { if (!done) { done = true; res(v); } };
+      rl.question(question, (a) => finish(a.trim()));
+      // Ctrl-D closes the interface: answer "no input" instead of crashing the
+      // next question with ERR_USE_AFTER_CLOSE.
+      rl.once('close', () => { inputEnded = true; finish(null); });
     });
   };
+
+  /** No answer means "no" — never opt into a network action on EOF. */
   const askYesNo = async (question: string, def: boolean): Promise<boolean> => {
-    const ans = (await ask(`${question} ${def ? '[Y/n]' : '[y/N]'} `)).toLowerCase();
-    if (ans === '') return def;
-    return ans.startsWith('y') || ans.startsWith('д'); // y/yes or Russian "да"
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const raw = await ask(`${question} ${def ? '[Y/n]' : '[y/N]'} `);
+      if (raw === null) return false;
+      const ans = raw.toLowerCase();
+      if (ans === '') return def;
+      if (/^(y|yes|д|да|1)/.test(ans)) return true;
+      if (/^(n|no|н|нет|0)/.test(ans)) return false;
+      w(color.yellow(`  ${t(lang, 'wiz.answerUnclear', { input: raw })}`));
+    }
+    return false;
   };
 
   w();
@@ -100,7 +125,9 @@ export async function runWizard(args: WizardArgs): Promise<ScanResult> {
 
   // Step 3 — live checks (opt-in, own project only).
   w(`  ${color.bold(t(lang, 'wiz.step3'))}${color.gray(t(lang, 'wiz.step3hint'))}`);
-  const sb = discoverSupabase(staticResult.files);
+  const sb = args.supabaseUrl && args.supabaseKey
+    ? { url: args.supabaseUrl, anonKey: args.supabaseKey, keyKind: 'jwt-anon' as const }
+    : discoverSupabase(staticResult.files);
   const fb = discoverFirebase(staticResult.files);
   let approveSupabase = false;
   let approveFirebase = false;
@@ -109,12 +136,12 @@ export async function runWizard(args: WizardArgs): Promise<ScanResult> {
     w(color.gray(t(lang, 'wiz.sbFound', { url: sb.url })));
     w(color.gray(t(lang, 'wiz.sbDesc1')));
     w(color.gray(t(lang, 'wiz.sbDesc2')));
-    approveSupabase = await askYesNo(t(lang, 'wiz.qSb'), false);
+    approveSupabase = args.autoYes ? true : await askYesNo(t(lang, 'wiz.qSb'), false);
     w();
   }
   if (fb) {
     w(color.gray(t(lang, 'wiz.fbFound', { id: fb.projectId })));
-    approveFirebase = await askYesNo(t(lang, 'wiz.qFb'), false);
+    approveFirebase = args.autoYes ? true : await askYesNo(t(lang, 'wiz.qFb'), false);
     w();
   }
 
@@ -124,7 +151,7 @@ export async function runWizard(args: WizardArgs): Promise<ScanResult> {
   if (!appUrl) {
     for (let attempt = 0; attempt < 2 && !appUrl; attempt++) {
       const raw = await ask(t(lang, 'wiz.qUrl'));
-      if (raw === '') break; // empty = deliberately skip
+      if (raw === null || raw === '') break; // EOF or empty = deliberately skip
       const normalized = normalizeUrl(raw);
       if (normalized) {
         appUrl = normalized;
@@ -134,15 +161,20 @@ export async function runWizard(args: WizardArgs): Promise<ScanResult> {
       }
     }
   }
-  rl?.close(); // all questions asked — release stdin before running checks
+  // Probing a live host always needs ownership confirmation, even from --url.
+  let approveLive = !!appUrl;
+  if (appUrl && !args.autoYes) {
+    approveLive = await askYesNo(t(lang, 'wiz.qOwn', { url: appUrl }), false);
+  }
+  rl?.close();
   w();
 
   const consent = async (req: ConsentRequest): Promise<boolean> => {
     switch (req.kind) {
       case 'supabase': return approveSupabase;
       case 'firebase': return approveFirebase;
-      case 'live': return !!appUrl;
-      case 'idor': return !!args.idorTokens;
+      case 'live': return approveLive;
+      case 'idor': return approveLive && !!args.idorTokens;
       default: return false;
     }
   };
@@ -152,7 +184,9 @@ export async function runWizard(args: WizardArgs): Promise<ScanResult> {
   return runFlow({
     root,
     configPath: args.config,
-    appUrl,
+    appUrl: approveLive ? appUrl : undefined,
+    supabaseUrl: args.supabaseUrl,
+    supabaseKey: args.supabaseKey,
     runDeps,
     idorTokens: args.idorTokens,
     precomputedStatic: staticResult,

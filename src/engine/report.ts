@@ -38,7 +38,7 @@ export function coverage(runs: CheckRun[]): Coverage {
  * be called clean because a check failed/partially ran/is unsupported, or
  * nothing was verified at all.
  */
-export type Gate = 'pass' | 'fail' | 'incomplete';
+export type Gate = 'pass' | 'warn' | 'fail' | 'incomplete';
 
 export interface Summary {
   score: number;
@@ -56,16 +56,21 @@ export function summarize(findings: Finding[], runs: CheckRun[] = []): Summary {
   }
   const cov = coverage(runs);
   const gate: Gate =
-    counts.critical > 0 ? 'fail' : cov.incomplete || cov.nothingVerified ? 'incomplete' : 'pass';
+    counts.critical > 0 ? 'fail'
+      : cov.incomplete || cov.nothingVerified ? 'incomplete'
+        : counts.warning > 0 ? 'warn'
+          : 'pass';
   return { score: Math.max(0, score), gate, counts, coverage: cov };
 }
 
 /** CI exit code from the same policy: 2 critical, 1 warning, 3 incomplete, 0 clean. */
 export function exitCodeFor(summary: Summary): number {
-  if (summary.counts.critical > 0) return 2;
-  if (summary.counts.warning > 0) return 1;
-  if (summary.gate === 'incomplete') return 3;
-  return 0;
+  switch (summary.gate) {
+    case 'fail': return 2;
+    case 'incomplete': return 3;
+    case 'warn': return 1;
+    default: return 0;
+  }
 }
 
 export function whereOf(f: Finding): string {
@@ -89,6 +94,7 @@ export function sortFindings(findings: Finding[]): Finding[] {
 export function badgeMarkdown(summary: Summary): string {
   if (summary.gate === 'fail') return `![EasyVibeGate](https://img.shields.io/badge/EasyVibeGate-${summary.score}%2F100-red)`;
   if (summary.gate === 'incomplete') return '![EasyVibeGate](https://img.shields.io/badge/EasyVibeGate-incomplete-yellow)';
+  if (summary.gate === 'warn') return `![EasyVibeGate](https://img.shields.io/badge/EasyVibeGate-${summary.score}%2F100-yellow)`;
   const c = summary.score >= 90 ? 'brightgreen' : summary.score >= 60 ? 'yellow' : 'orange';
   return `![EasyVibeGate](https://img.shields.io/badge/EasyVibeGate-${summary.score}%2F100-${c})`;
 }
@@ -105,6 +111,7 @@ function stackLine(result: ScanResult): string {
 function gateLabel(summary: Summary): string {
   if (summary.gate === 'fail') return color.red(color.bold('FAIL'));
   if (summary.gate === 'incomplete') return color.yellow(color.bold('INCOMPLETE'));
+  if (summary.gate === 'warn') return color.yellow(color.bold('WARN'));
   return color.green(color.bold('PASS'));
 }
 
@@ -137,8 +144,8 @@ export function renderConsole(result: ScanResult, summary: Summary, lang: Lang =
 function scoreColor(summary: Summary): string {
   const s = String(summary.score);
   if (summary.gate === 'fail') return color.red(s);
-  if (summary.gate === 'incomplete') return color.yellow(s);
-  return summary.score >= 90 ? color.green(s) : color.yellow(s);
+  if (summary.gate === 'incomplete' || summary.gate === 'warn') return color.yellow(s);
+  return color.green(s);
 }
 
 /** One plain-language line a non-technical user understands. */
