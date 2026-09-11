@@ -1,7 +1,7 @@
 // Lightweight regression tests for the detectors. Run with `pnpm test` after `pnpm build`.
 // Offline only — no network, no real backends.
 import assert from 'node:assert';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -1016,6 +1016,63 @@ await (async () => {
     assert.ok(ids(r2).includes('private_key'), `got ${ids(r2)}`);
   });
   rmSync(dir2, { recursive: true, force: true });
+})();
+
+// --- Regression: v0.4.5 audit — SQL is now lexed, not regex-matched ----------
+console.log('\nregressions (v0.4.5 audit — token-based SQL)');
+
+const rlsCase = async (name, sql, expectFinding) => {
+  const dir = fixture({ 'db/1.sql': sql });
+  const r = await scanStatic(dir);
+  check(name, () => {
+    const has = ids(r).includes('rls_missing');
+    assert.strictEqual(has, expectFinding, `got ${ids(r).join(',') || 'nothing'}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+};
+
+await rlsCase(
+  'ALTER TABLE IF EXISTS ... DISABLE is recognised',
+  'CREATE TABLE orders (id serial);\nALTER TABLE orders ENABLE ROW LEVEL SECURITY;\nALTER TABLE IF EXISTS orders DISABLE ROW LEVEL SECURITY;\n',
+  true,
+);
+await rlsCase(
+  "a backslash-escaped quote in E'...' does not hide the SQL after it",
+  "CREATE TABLE orders (id serial);\nALTER TABLE orders ENABLE ROW LEVEL SECURITY;\nSELECT E'it\\'s text';\nALTER TABLE orders DISABLE ROW LEVEL SECURITY;\n",
+  true,
+);
+await rlsCase(
+  'a double-quoted column alias is a NAME, not executed SQL',
+  'CREATE TABLE orders (id serial);\nSELECT 1 AS "ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";\n',
+  true,
+);
+await rlsCase(
+  'ALTER TABLE ONLY ... ENABLE still counts (no false alarm)',
+  'CREATE TABLE orders (id serial);\nALTER TABLE ONLY orders ENABLE ROW LEVEL SECURITY;\n',
+  false,
+);
+await rlsCase(
+  'a plain quoted identifier table still parses',
+  'CREATE TABLE "public"."orders" (id serial);\nALTER TABLE "public"."orders" ENABLE ROW LEVEL SECURITY;\n',
+  false,
+);
+
+await (async () => {
+  // A directory we cannot list is an unchecked subtree. Reporting PASS over it
+  // claims coverage the scan never had.
+  const dir = fixture({ 'index.ts': 'const a = 1;\n', 'secret/inner.ts': 'const b = 2;\n' });
+  chmodSync(join(dir, 'secret'), 0o000);
+  try {
+    const r = await scanStatic(dir);
+    const s = summarize(r.findings, r.runs);
+    check('an unreadable directory makes coverage incomplete, not a clean PASS', () => {
+      assert.strictEqual(s.gate, 'incomplete', `gate was ${s.gate}`);
+      assert.strictEqual(exitCodeFor(s), 3);
+    });
+  } finally {
+    chmodSync(join(dir, 'secret'), 0o755);
+    rmSync(dir, { recursive: true, force: true });
+  }
 })();
 
 // --- Liveness: every static detector must still FIRE on its own target -------

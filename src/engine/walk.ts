@@ -40,6 +40,8 @@ export interface WalkResult {
   /** Files we could not read — recorded so a partial scan is never silent. */
   skippedOversized: number;
   skippedUnreadable: number;
+  /** Directories we could not list. Their whole subtree went unchecked. */
+  skippedDirs: number;
 }
 
 /** Recursively collect scannable text files under `root`, skipping noise. */
@@ -47,6 +49,7 @@ export function walk(root: string): WalkResult {
   const out: ScanFile[] = [];
   let skippedOversized = 0;
   let skippedUnreadable = 0;
+  let skippedDirs = 0;
   const stack: string[] = [root];
 
   while (stack.length > 0) {
@@ -55,6 +58,10 @@ export function walk(root: string): WalkResult {
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch {
+      // A directory we cannot list is an unchecked subtree, not an empty one.
+      // Swallowing this silently let a project with an unreadable folder report
+      // full coverage and a clean PASS.
+      skippedDirs++;
       continue;
     }
     for (const ent of entries) {
@@ -89,5 +96,5 @@ export function walk(root: string): WalkResult {
       });
     }
   }
-  return { files: out, skippedOversized, skippedUnreadable };
+  return { files: out, skippedOversized, skippedUnreadable, skippedDirs };
 }

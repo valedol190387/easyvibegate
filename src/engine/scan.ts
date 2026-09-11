@@ -21,7 +21,7 @@ export interface ScanOptions {
 
 /** Run all Level 0 (static, read-only) checkers over a project directory. */
 export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<ScanResult> {
-  const { files, skippedOversized, skippedUnreadable } = walk(root);
+  const { files, skippedOversized, skippedUnreadable, skippedDirs } = walk(root);
   const detection = detect(root, files);
   const ctx = { root, files, detection };
 
@@ -40,12 +40,13 @@ export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<
   }
 
   // Files we could not read are missing coverage, not a clean result.
-  const lost = skippedOversized + skippedUnreadable;
+  const lost = skippedOversized + skippedUnreadable + skippedDirs;
   if (lost > 0) {
     const parts: string[] = [];
-    if (skippedOversized) parts.push(`${skippedOversized} over the 1 MB limit`);
-    if (skippedUnreadable) parts.push(`${skippedUnreadable} unreadable`);
-    runs.push({ id: 'walk', level: 0, status: 'partial', note: `${lost} file(s) not scanned (${parts.join(', ')})` });
+    if (skippedOversized) parts.push(`${skippedOversized} file(s) over the 1 MB limit`);
+    if (skippedUnreadable) parts.push(`${skippedUnreadable} unreadable file(s)`);
+    if (skippedDirs) parts.push(`${skippedDirs} unreadable director(y/ies) — their whole subtree went unchecked`);
+    runs.push({ id: 'walk', level: 0, status: 'partial', note: `not scanned: ${parts.join(', ')}` });
   }
 
   for (const checker of staticCheckers) {

@@ -1,99 +1,17 @@
 import type { Checker, Finding } from '../../types.js';
 import { lineAt } from '../../util/text.js';
 
-const IDENT = '(?:"[^"]+"|`[^`]+`|[A-Za-z_][A-Za-z0-9_$]*)';
-const QUALIFIED = `(?:(${IDENT})\\s*\\.\\s*)?(${IDENT})`;
-const CREATE_TABLE = new RegExp(`create\\s+table\\s+(if\\s+not\\s+exists\\s+)?${QUALIFIED}`, 'gi');
-const RLS_STMT = new RegExp(`alter\\s+table\\s+(?:only\\s+)?${QUALIFIED}\\s+(enable|disable)\\s+row\\s+level\\s+security`, 'gi');
-const DROP_TABLE = new RegExp(`drop\\s+table\\s+(?:if\\s+exists\\s+)?${QUALIFIED}`, 'gi');
-// SELECT ... INTO <table> also creates a table.
-const SELECT_INTO = new RegExp(`\\bselect\\b[^;]{0,400}?\\binto\\s+${QUALIFIED}`, 'gis');
+import { lexSql, type SqlToken } from '../../util/sql-lex.js';
 
 /** Normalize one SQL identifier: quoted keeps case, unquoted folds to lowercase. */
-function normIdent(raw: string): string {
-  if (raw.startsWith('"') && raw.endsWith('"')) return raw.slice(1, -1);
-  if (raw.startsWith('`') && raw.endsWith('`')) return raw.slice(1, -1);
-  return raw.toLowerCase();
+function normIdent(raw: string, quoted: boolean): string {
+  return quoted ? raw : raw.toLowerCase();
 }
-const keyOf = (schema: string | undefined, table: string) => `${schema ? normIdent(schema) : 'public'}.${normIdent(table)}`;
-const displayOf = (schema: string | undefined, table: string) => (schema ? `${schema}.${table}` : table);
+const keyOf = (schema: Name | undefined, table: Name) =>
+  `${schema ? normIdent(schema.text, schema.quoted) : 'public'}.${normIdent(table.text, table.quoted)}`;
+const displayOf = (schema: Name | undefined, table: Name) => (schema ? `${schema.text}.${table.text}` : table.text);
 
-/**
- * Blank out comments and string literals (keeping newlines and offsets) so that
- * SQL inside a string — e.g. SELECT 'ALTER TABLE x ENABLE ROW LEVEL SECURITY' —
- * or inside a comment is never mistaken for an executed statement.
- * Handles -- and block comments, '...' with '' escapes (and E'...'), and
- * $$ / $tag$ dollar-quoted strings. Double-quoted identifiers are kept.
- */
-export function maskSql(sql: string): string {
-  const out = sql.split('');
-  const n = sql.length;
-  const blank = (from: number, to: number) => {
-    for (let k = from; k < to && k < n; k++) if (out[k] !== '\n') out[k] = ' ';
-  };
-  let i = 0;
-  while (i < n) {
-    const ch = sql[i];
-    const next = sql[i + 1];
-    if (ch === '-' && next === '-') {
-      let j = i;
-      while (j < n && sql[j] !== '\n') j++;
-      blank(i, j); i = j; continue;
-    }
-    if (ch === '/' && next === '*') {
-      // PostgreSQL block comments NEST: in `/* a /* b */ still a comment */` the
-      // first `*/` closes only the inner one. Stopping there un-commented the
-      // rest and made commented-out DDL look like executed DDL.
-      let depth = 0;
-      let j = i;
-      while (j < n) {
-        if (sql[j] === '/' && sql[j + 1] === '*') { depth++; j += 2; continue; }
-        if (sql[j] === '*' && sql[j + 1] === '/') { depth--; j += 2; if (depth === 0) break; continue; }
-        j++;
-      }
-      const end = depth === 0 ? j : n;
-      blank(i, end); i = end; continue;
-    }
-    if (ch === "'") {
-      let j = i + 1;
-      while (j < n) {
-        if (sql[j] === "'") { if (sql[j + 1] === "'") { j += 2; continue; } break; }
-        j++;
-      }
-      const end = Math.min(j + 1, n);
-      blank(i, end); i = end; continue;
-    }
-    if (ch === '$') {
-      const m = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i, i + 64));
-      if (m) {
-        const tag = m[0];
-        const close = sql.indexOf(tag, i + tag.length);
-        const end = close === -1 ? n : close + tag.length;
-        // `DO $$ ... $$` is executed procedural code: its DDL is real, so keep the
-        // body visible. Other dollar-quoted strings (EXECUTE format(...)) are blanked.
-        const isDoBlock = /\bdo\s*$/i.test(sql.slice(Math.max(0, i - 8), i));
-        if (isDoBlock) {
-          const bodyStart = i + tag.length;
-          const bodyEnd = close === -1 ? n : close;
-          // Mask inside the body too (a string literal there is still a string),
-          // then jump past the CLOSING delimiter — scanning from just after the
-          // opening one would read that closing `$$` as a new opening tag and
-          // blank the entire rest of the file, hiding every later statement.
-          const inner = maskSql(sql.slice(bodyStart, bodyEnd));
-          for (let k = 0; k < inner.length; k++) out[bodyStart + k] = inner[k] as string;
-          // The `$$` delimiters stay VISIBLE on purpose: guard analysis reads this
-          // same masked text and needs them to find the block. Sharing one masked
-          // string is what keeps masking and guard parsing from disagreeing about
-          // what is a string or a comment.
-          i = end; continue;
-        }
-        blank(i, end); i = end; continue;
-      }
-    }
-    i++;
-  }
-  return out.join('');
-}
+interface Name { text: string; quoted: boolean }
 
 interface Event {
   kind: 'create' | 'enable' | 'disable' | 'drop';
@@ -109,42 +27,146 @@ interface Event {
 }
 
 /**
- * Spans inside a `DO $$ … $$` body that sit between an `IF … THEN` and its
- * `END IF`. DDL there runs only when the condition holds, and deciding that
- * needs an interpreter — so statements in these spans are reported as
- * "cannot be confirmed" rather than assumed to have run.
+ * Statement extraction over TOKENS, not over text.
  *
- * IFs nest, so this matches them with a stack: taking the first `END IF` as the
- * outer block's terminator ends the guard early and lets a statement after the
- * inner `END IF` look unconditional. `ELSIF` is not an opener (`\bif\b` does not
- * match inside it).
- *
- * Takes the SAME masked text the statements are read from, so `'end if'` inside a
- * string literal or a comment cannot terminate a guard — two separate parsers
- * disagreeing about that is exactly how such statements slipped through.
+ * Everything this used to get wrong — `E'it\'s'`, `'end if'` in a string, a
+ * column alias like `"ALTER TABLE x ENABLE ROW LEVEL SECURITY"`, nested block
+ * comments, `$tag$` bodies — is now impossible rather than patched: the lexer
+ * has already decided what is a string, a comment and a name, and only `word`
+ * tokens can ever be keywords.
  */
-function conditionalRanges(src: string): Array<[number, number]> {
-  const ranges: Array<[number, number]> = [];
-  for (const m of src.matchAll(/\bdo\s*(\$[A-Za-z_][A-Za-z0-9_]*\$|\$\$)/gi)) {
-    const tag = m[1] as string;
-    const bodyStart = (m.index ?? 0) + m[0].length;
-    const close = src.indexOf(tag, bodyStart);
-    const bodyEnd = close === -1 ? src.length : close;
-    const body = src.slice(bodyStart, bodyEnd);
-    const open: number[] = [];
-    for (const t of body.matchAll(/\bend\s+if\b|\bif\b/gi)) {
-      const at = t.index ?? 0;
-      if (/^end/i.test(t[0])) {
-        const from = open.pop();
-        if (from !== undefined) ranges.push([bodyStart + from, bodyStart + at]);
-      } else {
-        open.push(at);
-      }
-    }
-    // An IF left unterminated guards everything to the end of the block.
-    for (const from of open) ranges.push([bodyStart + from, bodyEnd]);
+interface Stmt { events: Omit<Event, 'file' | 'fileIdx' | 'line'>[] }
+
+const isWord = (t: SqlToken | undefined, w: string) => !!t && t.type === 'word' && t.value.toUpperCase() === w;
+const isName = (t: SqlToken | undefined) => !!t && (t.type === 'word' || t.type === 'quotedIdent');
+const nameOf = (t: SqlToken): Name => ({ text: t.value, quoted: t.type === 'quotedIdent' });
+
+/** Read `[schema .] table` at `i`; returns the names and the index after them. */
+function readQualified(ts: SqlToken[], i: number): { schema?: Name; table: Name; next: number } | null {
+  const first = ts[i];
+  if (!isName(first)) return null;
+  const dot = ts[i + 1];
+  const second = ts[i + 2];
+  if (dot && dot.type === 'punct' && dot.value === '.' && isName(second)) {
+    return { schema: nameOf(first as SqlToken), table: nameOf(second as SqlToken), next: i + 3 };
   }
+  return { table: nameOf(first as SqlToken), next: i + 1 };
+}
+
+/** Skip an optional `IF EXISTS` / `IF NOT EXISTS`; returns [nextIndex, seen]. */
+function skipIfExists(ts: SqlToken[], i: number): [number, boolean] {
+  if (!isWord(ts[i], 'IF')) return [i, false];
+  if (isWord(ts[i + 1], 'NOT') && isWord(ts[i + 2], 'EXISTS')) return [i + 3, true];
+  if (isWord(ts[i + 1], 'EXISTS')) return [i + 2, true];
+  return [i, false];
+}
+
+/**
+ * Token spans guarded by `IF … THEN … END IF` inside a DO block. IFs nest, so
+ * they are matched with a stack. Returns index ranges into `ts`.
+ */
+function guardedRanges(ts: SqlToken[]): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  const open: number[] = [];
+  for (let i = 0; i < ts.length; i++) {
+    if (isWord(ts[i], 'END') && isWord(ts[i + 1], 'IF')) {
+      const from = open.pop();
+      if (from !== undefined) ranges.push([from, i]);
+      i++; continue;
+    }
+    if (isWord(ts[i], 'IF')) open.push(i);
+  }
+  for (const from of open) ranges.push([from, ts.length]);
   return ranges;
+}
+
+/**
+ * Flatten a file into tokens, splicing every `DO $$ … $$` body in place so its
+ * DDL is analyzed as executed code while the surrounding file keeps its own
+ * order. Returns the tokens plus the guarded index ranges.
+ */
+function flatten(sql: string): { ts: SqlToken[]; guards: Array<[number, number]> } {
+  const top = lexSql(sql).filter((t) => t.type !== 'comment');
+  const ts: SqlToken[] = [];
+  const guards: Array<[number, number]> = [];
+  for (let i = 0; i < top.length; i++) {
+    const t = top[i] as SqlToken;
+    // `DO $$ ... $$` is executed procedural code: lex its body and inline it.
+    if (t.type === 'dollarString' && isWord(top[i - 1], 'DO')) {
+      const inner = lexSql(t.value, t.bodyStart ?? t.start).filter((x) => x.type !== 'comment');
+      const base = ts.length;
+      for (const [a, b] of guardedRanges(inner)) guards.push([base + a, base + b]);
+      ts.push(...inner);
+      continue;
+    }
+    ts.push(t);
+  }
+  return { ts, guards };
+}
+
+/** Extract CREATE / ENABLE / DISABLE / DROP / SELECT INTO events from one file. */
+function readStatements(sql: string): Stmt {
+  const { ts, guards } = flatten(sql);
+  const events: Stmt['events'] = [];
+  const guarded = (i: number) => guards.some(([a, b]) => i >= a && i < b);
+  const add = (
+    kind: Event['kind'], schema: Name | undefined, table: Name, at: number, idx: number, ifNotExists = false,
+  ) => events.push({
+    kind, key: keyOf(schema, table), ifNotExists, display: displayOf(schema, table),
+    offset: at, conditional: guarded(idx),
+  });
+
+  for (let i = 0; i < ts.length; i++) {
+    const t = ts[i] as SqlToken;
+    if (t.type !== 'word') continue;
+    const w = t.value.toUpperCase();
+
+    if (w === 'CREATE' && isWord(ts[i + 1], 'TABLE')) {
+      const [j, ine] = skipIfExists(ts, i + 2);
+      const q = readQualified(ts, j);
+      if (q) add('create', q.schema, q.table, t.start, i, ine);
+      continue;
+    }
+
+    if (w === 'DROP' && isWord(ts[i + 1], 'TABLE')) {
+      const [j] = skipIfExists(ts, i + 2);
+      const q = readQualified(ts, j);
+      if (q) add('drop', q.schema, q.table, t.start, i);
+      continue;
+    }
+
+    if (w === 'ALTER' && isWord(ts[i + 1], 'TABLE')) {
+      // `ALTER TABLE [IF EXISTS] [ONLY] name ENABLE|DISABLE ROW LEVEL SECURITY`
+      let [j] = skipIfExists(ts, i + 2);
+      if (isWord(ts[j], 'ONLY')) j++;
+      const q = readQualified(ts, j);
+      if (!q) continue;
+      let k = q.next;
+      if (isWord(ts[k], '*')) k++;
+      const verb = ts[k];
+      if (!verb || verb.type !== 'word') continue;
+      const v = verb.value.toUpperCase();
+      if ((v !== 'ENABLE' && v !== 'DISABLE') || !isWord(ts[k + 1], 'ROW') || !isWord(ts[k + 2], 'LEVEL') || !isWord(ts[k + 3], 'SECURITY')) continue;
+      add(v === 'DISABLE' ? 'disable' : 'enable', q.schema, q.table, t.start, i);
+      continue;
+    }
+
+    if (w === 'SELECT') {
+      // `SELECT ... INTO <table>` creates a table. Stop at the statement end.
+      for (let k = i + 1; k < ts.length; k++) {
+        const u = ts[k] as SqlToken;
+        if (u.type === 'punct' && u.value === ';') break;
+        if (u.type === 'word' && u.value.toUpperCase() === 'FROM') break;
+        if (isWord(u, 'INTO')) {
+          const q = readQualified(ts, k + 1);
+          if (q) add('create', q.schema, q.table, t.start, i);
+          break;
+        }
+      }
+      continue;
+    }
+  }
+  return { events };
 }
 
 /**
@@ -177,18 +199,9 @@ export const rlsMigrationsChecker: Checker = {
 
     const events: Event[] = [];
     sqlFiles.forEach((f, fileIdx) => {
-      const masked = maskSql(f.content);
-      const guards = conditionalRanges(masked);
-      const push = (kind: Event['kind'], schema: string | undefined, table: string, offset: number, ifNotExists = false) =>
-        events.push({
-          kind, key: keyOf(schema, table), ifNotExists, file: f.rel, line: lineAt(f.content, offset),
-          display: displayOf(schema, table), fileIdx, offset,
-          conditional: guards.some(([a, b]) => offset >= a && offset < b),
-        });
-      for (const m of masked.matchAll(CREATE_TABLE)) push('create', m[2], m[3] ?? '', m.index ?? 0, !!m[1]);
-      for (const m of masked.matchAll(RLS_STMT)) push((m[3] ?? '').toLowerCase() === 'disable' ? 'disable' : 'enable', m[1], m[2] ?? '', m.index ?? 0);
-      for (const m of masked.matchAll(DROP_TABLE)) push('drop', m[1], m[2] ?? '', m.index ?? 0);
-      for (const m of masked.matchAll(SELECT_INTO)) push('create', m[1], m[2] ?? '', m.index ?? 0);
+      for (const e of readStatements(f.content).events) {
+        events.push({ ...e, file: f.rel, fileIdx, line: lineAt(f.content, e.offset) });
+      }
     });
     // True apply order: by migration file, then by statement position in the file.
     events.sort((a, b) => a.fileIdx - b.fileIdx || a.offset - b.offset);
