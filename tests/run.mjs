@@ -886,5 +886,72 @@ await (async () => {
 })();
 
 
+
+// --- Liveness: every static detector must still FIRE on its own target -------
+// Three detectors were once silently disabled by "fix the false positive"
+// changes while the suite stayed green, because those tests only asserted that
+// the false positive was gone. An assertion of absence cannot tell a detector
+// that stopped lying from one that stopped working. This table is the other
+// half: one minimal positive sample per finding id. Values are synthetic and
+// non-functional; keep them free of the words "example"/"test", which the
+// placeholder filter correctly suppresses.
+console.log('\ndetector liveness (one positive sample per finding id)');
+
+const A36 = 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5';
+const A35 = 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA';
+const A30 = 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1';
+const A24 = 'aB3dE5fG7hJ9kL1mN3pQ5rS7';
+
+const LIVENESS = {
+  openai_key: { 'a.ts': `const k = "sk-proj-${A24}";\n` },
+  anthropic_key: { 'a.ts': `const k = "sk-ant-api03-${A30}";\n` },
+  aws_key: { 'a.ts': 'const k = "AKIA2J7QK3XN4MZP5RTV";\n' },
+  stripe_live: { 'a.ts': `const k = "sk_live_${A24}";\n` },
+  github_token: { 'a.ts': `const k = "ghp_${A36}";\n` },
+  slack_token: { 'a.ts': `const k = "xoxb-123456789012-123456789012-${A24}";\n` },
+  sendgrid_key: { 'a.ts': `const k = "SG.${A24}.${A30}";\n` },
+  hf_token: { 'a.ts': `const k = "hf_${A30}";\n` },
+  npm_token: { 'a.ts': `const k = "npm_${A30}";\n` },
+  google_api_key: { 'a.ts': `const k = "AIza${A35}";\n` },
+  telegram_bot: { 'a.ts': `const k = "123456789:${A35}";\n` },
+  db_url_password: { 'a.ts': 'const u = "postgres://admin:S3cretPa55word@prod-db.internal:5432/app";\n' },
+  supabase_secret_key: { 'a.ts': `const k = "sb_secret_${A24}";\n` },
+  private_key: { 'id_rsa.pem': '-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----\n' },
+  generic_secret: { 'a.ts': `const apiSecret = "${A30}";\n` },
+  env_secret: { '.env': 'PASSWORD=G7m2Q9v4R8c5N1p6Xk\n' },
+  public_env_secret: { '.env': `NEXT_PUBLIC_API_TOKEN=${A30}\n` },
+  cors_star: { 'a.ts': 'app.use(cors({origin: "*"}));\n' },
+  debug_on: { 'a.py': 'DEBUG = True\n' },
+  eval_use: { 'a.ts': 'const r = eval(userInput);\n' },
+  jwt_alg_none: { 'a.ts': 'const opts = { algorithm: "none" };\n' },
+  sql_interpolation: { 'a.py': 'q = f"SELECT * FROM users WHERE id = {uid}"\n' },
+  rls_missing: { 'db/1.sql': 'CREATE TABLE public.orders (id serial);\n' },
+  endpoint_inventory: { 'pages/api/users.ts': 'export default function h(){}\n' },
+  env_git_unverified: { '.env': 'PASSWORD=G7m2Q9v4R8c5N1p6Xk\n' },
+};
+
+for (const [id, files] of Object.entries(LIVENESS)) {
+  const dir = fixture(files);
+  const r = await scanStatic(dir);
+  const got = ids(r);
+  check(`${id} fires on its own target`, () => {
+    assert.ok(got.includes(id), `detector is not firing — got: ${got.join(',') || 'nothing'}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+
+await (async () => {
+  // The git-aware pair needs a real repository to reach its verdict.
+  const dir = fixture({ '.env': 'PASSWORD=G7m2Q9v4R8c5N1p6Xk\n', '.gitignore': 'node_modules/\n' });
+  spawnSync('git', ['-C', dir, 'init', '-q']);
+  spawnSync('git', ['-C', dir, 'add', '-A']);
+  const r = await scanStatic(dir);
+  check('env_committed fires when .env is tracked by git', () => {
+    assert.ok(ids(r).includes('env_committed'), `got: ${ids(r).join(',') || 'nothing'}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+
 console.log(`\n${passed} passed, ${failures.length} failed`);
 process.exit(failures.length ? 1 : 0);
