@@ -8,6 +8,10 @@
 
 Most scanners grep your code and say *"you might have leaked a key."* EasyVibeGate also goes to the running backend: for **Supabase/Firebase** it walks in with the public key and shows which tables are readable by anyone, with the exact `curl` — plus SQL to close it. It is honest about coverage: every check reports whether it actually ran, so a failed or skipped check is never shown as a green "all clear".
 
+> ⚠️ **Not published to npm yet** — `npx easyvibegate` will work after publishing.
+> Today, install straight from GitHub: `npx github:valedol190387/easyvibegate`
+> (it fetches the repo and builds itself).
+>
 > Status: **v0.3, early.** Best-supported stack: **Next.js + Supabase**. Code review runs on any stack; the live backend probe is read-only and Supabase/Firebase-focused. Not a penetration test.
 
 ## How to run
@@ -21,7 +25,8 @@ If you use **Cursor, Claude Code, or Codex**, you don't need to type anything in
 ```
 Check this project's security with EasyVibeGate and explain the result in plain language.
 
-1. Run at the project root:  npx easyvibegate . --no-wizard --deps
+1. Run at the project root:  npx github:valedol190387/easyvibegate . --no-wizard --deps
+   (After the npm release the short form is: npx easyvibegate . --no-wizard --deps)
    (Add  --url <my-app-url> --i-own-this  only if this is my project
     and I allow the live backend probe.)
 2. Open and read the file:  easyvibegate-report/ai-fix-prompt.md
@@ -34,10 +39,10 @@ The agent runs it, reads the report, and explains the findings. You can also jus
 ### Option 2. One command in the terminal
 
 ```bash
-npx easyvibegate
+npx github:valedol190387/easyvibegate
 ```
 
-Run it inside your project. A friendly wizard asks a few plain yes/no questions, tells you what's wrong in plain language, and writes a ready-to-use fix plan. No install, no config, no runtime deps.
+Run it inside your project. (After the npm release: `npx easyvibegate`.) A friendly wizard asks a few plain yes/no questions, tells you what's wrong in plain language, and writes a ready-to-use fix plan. No install, no config, no runtime deps.
 
 ### Option 3. In CI (GitHub Actions)
 
@@ -53,7 +58,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
-      - run: npx easyvibegate . --ci
+      - run: npx github:valedol190387/easyvibegate . --ci
 ```
 
 Exit codes: `2` = critical, `1` = warnings, `3` = a check failed to run, `0` = clean.
@@ -81,9 +86,11 @@ npm / pnpm / yarn audit. A registry error is reported as "failed", never "clean"
 
 ## Scoring & coverage
 
-- **Gate:** `fail` if any critical, else `pass`.
-- **Score:** 0–100.
-- **Coverage line:** "Checks: N ok · M failed · K skipped". A failed or not-run check is shown, never hidden behind a green "all clear".
+- **One gate policy everywhere** (CI, JSON, badge, console): `fail` — a critical finding; `incomplete` — nothing critical, but a check failed / ran partially / is unsupported; `pass` — everything ran and is clean.
+- **Score:** 0–100. An `incomplete` run is **never a green badge**.
+- **Coverage line:** "Checks: N ok · M failed · K skipped".
+- **Exit codes (`--ci`):** `2` critical, `1` warnings, `3` a check did not complete, `0` clean.
+- Reports record the scanned path, version and timestamp, so reports from different projects never get mixed up.
 
 ## Suppressing noise
 

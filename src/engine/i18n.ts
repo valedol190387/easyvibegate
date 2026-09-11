@@ -50,7 +50,7 @@ const EN: Dict = {
   'sev.advisory': 'Advisory',
   // wizard
   'wiz.sub1': "I'll find security holes and tell you exactly what to fix.",
-  'wiz.sub2': 'Nothing leaves your machine. Live checks run only if you say yes.',
+  'wiz.sub2': 'Code review is offline. The dependency audit and live checks use the network, and only if you say yes.',
   'wiz.project': 'Project: {root}',
   'wiz.step1': 'Step 1/3 — reading your code',
   'wiz.step1hint': '  (safe, offline)',
@@ -67,6 +67,9 @@ const EN: Dict = {
   'wiz.qFb': '  Test it for anonymous read access?',
   'wiz.qUrl': '  App running at a URL? Paste it to test headers/endpoints, or Enter to skip: ',
   'wiz.running': 'Running checks…',
+  'wiz.fromFlag': 'taken from the command line',
+  'wiz.urlNormalized': 'will probe {url}',
+  'wiz.urlInvalid': '"{input}" is not a valid address. Use e.g. https://myapp.com, or press Enter to skip.',
   // ai-fix
   'aifix.title': '# Security fix task for this codebase',
   'aifix.intro': 'You are a senior application-security engineer. EasyVibeGate scanned this project and found {crit} critical and {warn} warning issue(s) (score {score}/100, gate {gate}). Fix them one by one, most severe first, without breaking existing functionality.',
@@ -86,7 +89,7 @@ const EN: Dict = {
   'aifix.done': 'When done',
   'aifix.done1': '- List which secrets I must rotate myself.',
   'aifix.done2': '- List any migration I must run and where.',
-  'aifix.done3': '- Summarize what is fixed and what still needs a live re-scan (`npx easyvibegate . --url <app> --i-own-this`).',
+  'aifix.done3': '- Summarize what is fixed and what still needs a live re-scan (`npx github:valedol190387/easyvibegate . --url <app> --i-own-this`).',
 };
 
 const RU: Dict = {
@@ -132,7 +135,7 @@ const RU: Dict = {
   'sev.info': 'Инфо',
   'sev.advisory': 'К сведению',
   'wiz.sub1': 'Я найду дыры в безопасности и скажу, что именно чинить.',
-  'wiz.sub2': 'Ничего не уходит с твоей машины. Живые проверки — только если ты согласишься.',
+  'wiz.sub2': 'Осмотр кода — офлайн. Аудит зависимостей и живые проверки ходят в сеть, и только с твоего согласия.',
   'wiz.project': 'Проект: {root}',
   'wiz.step1': 'Шаг 1/3 — читаю твой код',
   'wiz.step1hint': '  (безопасно, офлайн)',
@@ -149,6 +152,9 @@ const RU: Dict = {
   'wiz.qFb': '  Проверить его на анонимный доступ к чтению?',
   'wiz.qUrl': '  Приложение запущено по URL? Вставь его для проверки заголовков/эндпоинтов или Enter чтобы пропустить: ',
   'wiz.running': 'Выполняю проверки…',
+  'wiz.fromFlag': 'взято из командной строки',
+  'wiz.urlNormalized': 'проверю {url}',
+  'wiz.urlInvalid': '«{input}» — это не похоже на адрес. Например: https://myapp.com, или Enter чтобы пропустить.',
   'aifix.title': '# Задача: починить безопасность этого проекта',
   'aifix.intro': 'Ты — старший инженер по безопасности приложений. EasyVibeGate просканировал проект и нашёл {crit} критичных и {warn} предупреждений (оценка {score}/100, итог {gate}). Чини их по одному, начиная с самых серьёзных, не ломая существующую функциональность.',
   'aifix.rules': 'Правила',
@@ -167,7 +173,7 @@ const RU: Dict = {
   'aifix.done': 'Когда закончишь',
   'aifix.done1': '- Перечисли, какие секреты я должен сменить сам.',
   'aifix.done2': '- Перечисли, какие миграции нужно прогнать и где.',
-  'aifix.done3': '- Подведи итог: что починено и что ещё требует живой перепроверки (`npx easyvibegate . --url <app> --i-own-this`).',
+  'aifix.done3': '- Подведи итог: что починено и что ещё требует живой перепроверки (`npx github:valedol190387/easyvibegate . --url <app> --i-own-this`).',
 };
 
 const TABLES: Record<Lang, Dict> = { en: EN, ru: RU };

@@ -3,6 +3,7 @@ import type { ScanResult } from './scan.js';
 import type { Summary } from './report.js';
 import { sortFindings, whereOf } from './report.js';
 import { t, type Lang } from './i18n.js';
+import { VERSION } from './version.js';
 
 const LABEL: Record<Severity, string> = { critical: 'CRITICAL', warning: 'WARNING', info: 'INFO', advisory: 'ADVISORY' };
 
@@ -18,6 +19,8 @@ export function buildAiFixPrompt(result: ScanResult, summary: Summary, lang: Lan
   const lines: string[] = [];
 
   lines.push(t(lang, 'aifix.title'));
+  lines.push('');
+  lines.push(`Project: \`${result.root}\` · scanned by EasyVibeGate ${VERSION} at ${new Date().toISOString()}`);
   lines.push('');
   lines.push(t(lang, 'aifix.intro', { crit: summary.counts.critical, warn: summary.counts.warning, score: summary.score, gate: summary.gate.toUpperCase() }));
   lines.push('');

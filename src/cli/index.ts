@@ -17,22 +17,13 @@ import { buildAiFixPrompt } from '../engine/aifix.js';
 import { runWizard } from './wizard.js';
 import { pickLang } from '../engine/i18n.js';
 import { color } from '../engine/util/color.js';
-
-// Single source of truth for the version: package.json.
-function readVersion(): string {
-  try {
-    return JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')).version ?? '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-}
-const VERSION = readVersion();
+import { VERSION } from '../engine/version.js';
 
 type Format = 'all' | 'md' | 'json' | 'none';
 
 interface Args {
   path: string;
-  output: string;
+  output?: string;
   format: Format;
   ci: boolean;
   config?: string;
@@ -64,7 +55,7 @@ Level 0 (static, any stack) always runs. Level 1/2 need opt-in.
 A fix plan (ai-fix-prompt.md) is always written next to the report.
 
 Options:
-  -o, --output <dir>     Report directory (default: ./easyvibegate-report)
+  -o, --output <dir>     Report directory (default: <project>/easyvibegate-report)
   -f, --format <fmt>     all | md | json | none (default: all)
       --ci               Quiet; exit non-zero on findings (2 critical, 1 warning)
   -c, --config <file>    Path to a easyvibegate config JSON
@@ -93,7 +84,6 @@ Ethics: the live probe sends real requests. Only run it against systems you own.
 function parseArgs(argv: string[]): Args {
   const a: Args = {
     path: '.',
-    output: 'easyvibegate-report',
     format: 'all',
     ci: false,
     iOwnThis: false,
@@ -200,60 +190,82 @@ async function main(): Promise<void> {
     process.stderr.write(`easyvibegate: path not found or not a directory: ${root}\n`);
     process.exit(2);
   }
-  const autoYes = args.iOwnThis || args.yes;
-  const lang = pickLang(args.lang);
-
-  // Default to the friendly wizard when a human runs it in a terminal without
-  // any automation/power flags. CI and flag-driven runs use direct mode.
-  const powerFlags = args.ci || autoYes || !!args.appUrl || !!args.supabaseUrl || !!args.idorTokens || args.deps;
-  if (args.wizard || (!args.noWizard && !powerFlags && !!process.stdin.isTTY)) {
-    await runWizard({ path: args.path, output: args.output, config: args.config, lang });
-    return;
+  // An explicitly requested config must exist and be valid — silently falling
+  // back to defaults would apply different ignore rules than the user asked for.
+  if (args.config !== undefined) {
+    const problem = validateConfigFile(resolve(args.config));
+    if (problem) {
+      process.stderr.write(`easyvibegate: --config ${args.config}: ${problem}\n`);
+      process.exit(2);
+    }
   }
 
-  const interactive = !!process.stdin.isTTY && !args.ci && !autoYes;
-  const log = (m: string) => { if (!args.ci) process.stderr.write(color.gray(`  ${m}\n`)); };
+  const autoYes = args.iOwnThis || args.yes;
+  const lang = pickLang(args.lang);
+  // Reports land next to the scanned project by default, so scanning several
+  // projects from one shell never overwrites another project's report.
+  const outDir = args.output !== undefined ? resolve(args.output) : join(root, 'easyvibegate-report');
 
-  const consent = async (req: ConsentRequest): Promise<boolean> => {
-    if (autoYes) return true;
-    if (!interactive) {
-      process.stderr.write(color.gray(`  skipped ${req.kind} probe of ${req.target} — needs --i-own-this or an interactive terminal\n`));
-      return false;
-    }
-    const ans = await ask(color.yellow(`  Probe ${req.kind} → ${req.target}?\n    (${req.detail}) [y/N] `));
-    return /^y(es)?$/i.test(ans.trim());
-  };
+  // Use the friendly wizard when a human runs it in a terminal without
+  // automation flags; --wizard forces it. Either way the pipeline below is shared.
+  const powerFlags = autoYes || !!args.supabaseUrl;
+  const useWizard = args.wizard || (!args.noWizard && !args.ci && !powerFlags && !!process.stdin.isTTY);
 
-  const result = await runFlow({
-    root,
-    configPath: args.config,
-    appUrl: args.appUrl,
-    supabaseUrl: args.supabaseUrl,
-    supabaseKey: args.supabaseKey,
-    runDeps: args.deps,
-    idorTokens: args.idorTokens,
-    consent,
-    log,
-  });
+  let result;
+  if (useWizard) {
+    result = await runWizard({
+      path: args.path,
+      config: args.config,
+      lang,
+      appUrl: args.appUrl,
+      deps: args.deps,
+      idorTokens: args.idorTokens,
+    });
+  } else {
+    const interactive = !!process.stdin.isTTY && !args.ci && !autoYes;
+    const log = (m: string) => { if (!args.ci) process.stderr.write(color.gray(`  ${m}\n`)); };
+    const consent = async (req: ConsentRequest): Promise<boolean> => {
+      if (autoYes) return true;
+      if (!interactive) {
+        process.stderr.write(color.gray(`  skipped ${req.kind} probe of ${req.target} — needs --i-own-this or an interactive terminal\n`));
+        return false;
+      }
+      const ans = await ask(color.yellow(`  Probe ${req.kind} → ${req.target}?\n    (${req.detail}) [y/N] `));
+      return /^y(es)?$/i.test(ans.trim());
+    };
+    result = await runFlow({
+      root,
+      configPath: args.config,
+      appUrl: args.appUrl,
+      supabaseUrl: args.supabaseUrl,
+      supabaseKey: args.supabaseKey,
+      runDeps: args.deps,
+      idorTokens: args.idorTokens,
+      consent,
+      log,
+    });
+  }
+
+  // ---- One shared pipeline: console, reports, verdict, exit code. ----
   const summary = summarize(result.findings, result.runs);
 
   if (!args.ci) process.stdout.write(renderConsole(result, summary, lang) + '\n');
 
   if (args.format !== 'none') {
-    mkdirSync(args.output, { recursive: true });
+    mkdirSync(outDir, { recursive: true });
     const written: string[] = [];
     if (args.format === 'all' || args.format === 'md') {
-      const p = join(args.output, 'report.md');
+      const p = join(outDir, 'report.md');
       writeFileSync(p, renderMarkdown(result, summary, lang), 'utf8');
       written.push(p);
     }
     if (args.format === 'all' || args.format === 'json') {
-      const p = join(args.output, 'report.json');
+      const p = join(outDir, 'report.json');
       writeFileSync(p, renderJson(result, summary), 'utf8');
       written.push(p);
     }
     // The fix plan is the whole point — always produce it alongside a report.
-    writeFileSync(join(args.output, 'ai-fix-prompt.md'), buildAiFixPrompt(result, summary, lang), 'utf8');
+    writeFileSync(join(outDir, 'ai-fix-prompt.md'), buildAiFixPrompt(result, summary, lang), 'utf8');
     if (!args.ci && written.length) {
       process.stdout.write(color.gray(`  report: ${written.join(', ')}\n`));
       process.stdout.write(color.gray(`  badge:  ${badgeMarkdown(summary)}\n\n`));
@@ -262,10 +274,29 @@ async function main(): Promise<void> {
 
   if (!args.ci) {
     process.stdout.write(renderVerdict(summary, lang) + '\n\n');
-    if (args.format !== 'none') process.stdout.write(renderNextSteps(summary, args.output, lang));
+    if (args.format !== 'none') process.stdout.write(renderNextSteps(summary, outDir, lang));
   }
 
   if (args.ci) process.exit(exitCodeFor(summary)); // 2 critical, 1 warning, 3 incomplete, 0 clean
+}
+
+/** Returns a human message when an explicitly given config is unusable. */
+function validateConfigFile(path: string): string | null {
+  if (!existsSync(path)) return 'file not found';
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (e) {
+    return `invalid JSON (${e instanceof Error ? e.message : String(e)})`;
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return 'must be a JSON object';
+  const cfg = parsed as Record<string, unknown>;
+  for (const key of ['ignore', 'ignorePaths']) {
+    const v = cfg[key];
+    if (v === undefined) continue;
+    if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) return `"${key}" must be an array of strings`;
+  }
+  return null;
 }
 
 main().catch((err) => {

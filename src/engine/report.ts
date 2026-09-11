@@ -3,6 +3,7 @@ import { SEVERITY_ORDER } from './types.js';
 import type { ScanResult } from './scan.js';
 import { color } from './util/color.js';
 import { t, type Lang } from './i18n.js';
+import { VERSION } from './version.js';
 
 const WEIGHTS: Record<Severity, number> = { critical: 25, warning: 8, info: 2, advisory: 0 };
 const EMOJI: Record<Severity, string> = { critical: '🔴', warning: '🟡', info: '🔵', advisory: '⚪' };
@@ -182,6 +183,8 @@ export function renderMarkdown(result: ScanResult, summary: Summary, lang: Lang 
   lines.push('');
   lines.push(t(lang, 'md.stack', { stack: stackLine(result) }));
   lines.push('');
+  lines.push(`\`${result.root}\` · EasyVibeGate ${VERSION} · ${new Date().toISOString()}`);
+  lines.push('');
   lines.push(badgeMarkdown(summary));
   lines.push('');
 
@@ -222,6 +225,9 @@ export function renderMarkdown(result: ScanResult, summary: Summary, lang: Lang 
 export function renderJson(result: ScanResult, summary: Summary): string {
   return JSON.stringify(
     {
+      projectRoot: result.root,
+      scannedAt: new Date().toISOString(),
+      version: VERSION,
       score: summary.score,
       gate: summary.gate,
       counts: summary.counts,

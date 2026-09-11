@@ -1,6 +1,6 @@
 {
   "name": "easyvibegate",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Interactive security scanner for vibe-coded apps (focus: Next.js + Supabase). Checks common risks and shows evidence where it can.",
   "type": "module",
   "bin": {
@@ -16,7 +16,8 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "node tests/run.mjs",
-    "prepublishOnly": "pnpm build",
+    "prepare": "tsc",
+    "prepublishOnly": "tsc",
     "easyvibegate": "node dist/cli/index.js"
   },
   "author": "valedol190387 (https://github.com/valedol190387)",

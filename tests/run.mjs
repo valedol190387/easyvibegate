@@ -5,10 +5,11 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { scanStatic } from '../dist/engine/scan.js';
 import { collectEndpoints, concretePath } from '../dist/engine/endpoints.js';
 import { discoverSupabase } from '../dist/engine/checkers/backend/supabase.js';
+import { normalizeUrl } from '../dist/cli/wizard.js';
 import { setRequestImpl } from '../dist/engine/net/http.js';
 import { checkLiveSite } from '../dist/engine/checkers/live/http-checks.js';
 import { idorDifferential } from '../dist/engine/checkers/live/idor.js';
@@ -267,6 +268,79 @@ await (async () => {
     assert.strictEqual(p.status, 3);
     assert.strictEqual(json.gate, 'incomplete');
     assert.strictEqual(json.coverage.completed, 0, 'static checks with no files must not count as coverage');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+console.log('\nwizard <-> CLI are one pipeline');
+
+const CRITICAL_FIXTURE = { 'db/001.sql': 'CREATE TABLE public.users (id uuid, email text);\n' };
+const runCli = (argv, opts = {}) => spawnSync(process.execPath, [CLI, ...argv], { encoding: 'utf8', input: opts.input ?? '', cwd: opts.cwd });
+
+check('normalizeUrl: bare domain is accepted, junk is rejected', () => {
+  assert.strictEqual(normalizeUrl('example.com'), 'https://example.com');
+  assert.strictEqual(normalizeUrl('http://localhost:3000'), 'http://localhost:3000');
+  assert.strictEqual(normalizeUrl('not a url'), null);
+  assert.strictEqual(normalizeUrl(''), null);
+});
+
+await (async () => {
+  const dir = fixture(CRITICAL_FIXTURE);
+  const p = runCli([dir, '--wizard', '--ci', '--format', 'none'], { input: 'n\n\n' });
+  check('--wizard --ci exits 2 on a critical finding (no CI bypass)', () => {
+    assert.strictEqual(p.status, 2, `got ${p.status}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture(CRITICAL_FIXTURE);
+  runCli([dir, '--wizard', '--format', 'none'], { input: 'n\n\n' });
+  check('--wizard --format none writes no report files', () => {
+    assert.ok(!existsSync(join(dir, 'easyvibegate-report')), 'report dir must not be created');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture(CRITICAL_FIXTURE);
+  // Answer: deps=n, url=127.0.0.1:1 (refused instantly, proves the URL reached the flow).
+  runCli([dir, '--wizard', '--format', 'json'], { input: 'n\nhttp://127.0.0.1:1\n' });
+  const json = JSON.parse(readFileSync(join(dir, 'easyvibegate-report', 'report.json'), 'utf8'));
+  check('piped wizard answers are not lost (URL reaches the live probe)', () => {
+    assert.ok(json.runs.some((r) => r.id === 'live-site'), `runs: ${json.runs.map((r) => r.id).join(',')}`);
+  });
+  check('report records projectRoot / version / scannedAt', () => {
+    assert.strictEqual(json.projectRoot, dir);
+    assert.ok(json.version && json.scannedAt, 'version and scannedAt must be present');
+  });
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+await (async () => {
+  const dir = fixture(CRITICAL_FIXTURE);
+  const other = fixture({ 'readme.md': 'x' });
+  // Run from an unrelated cwd: the report must land next to the scanned project.
+  runCli([dir, '--no-wizard', '--format', 'json'], { cwd: other });
+  check('default report goes to <project>/easyvibegate-report, not cwd', () => {
+    assert.ok(existsSync(join(dir, 'easyvibegate-report', 'report.json')), 'report must be in the scanned project');
+    assert.ok(!existsSync(join(other, 'easyvibegate-report')), 'must not write into the current directory');
+  });
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(other, { recursive: true, force: true });
+})();
+
+check('explicitly given --config that does not exist is an error', () => {
+  const p = runCli(['.', '--no-wizard', '--ci', '--format', 'none', '--config', 'definitely-missing.json']);
+  assert.strictEqual(p.status, 2, `got ${p.status}: ${p.stderr}`);
+  assert.match(p.stderr, /config/i);
+});
+
+await (async () => {
+  const dir = fixture({ 'bad.json': '{ "ignorePaths": [1, 2] }' });
+  const p = runCli(['.', '--no-wizard', '--ci', '--format', 'none', '--config', join(dir, 'bad.json')]);
+  check('--config with wrong value types is an error', () => {
+    assert.strictEqual(p.status, 2, `got ${p.status}: ${p.stderr}`);
   });
   rmSync(dir, { recursive: true, force: true });
 })();
