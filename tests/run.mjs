@@ -1075,6 +1075,47 @@ await (async () => {
   }
 })();
 
+// --- Regression: v0.5.0 audit — unknown SQL must not read as clean -----------
+console.log('\nregressions (v0.5.0 audit — unknown ≠ clean)');
+
+const BASE = 'CREATE TABLE orders (id serial);\nALTER TABLE orders ENABLE ROW LEVEL SECURITY;\n';
+await rlsCase('ALTER TABLE name * DISABLE is recognised (the * is punctuation, not a word)',
+  BASE + 'ALTER TABLE orders * DISABLE ROW LEVEL SECURITY;\n', true);
+await rlsCase('an RLS toggle that is the SECOND action of an ALTER TABLE is recognised',
+  BASE + 'ALTER TABLE orders ADD COLUMN note text,\n  DISABLE ROW LEVEL SECURITY;\n', true);
+await rlsCase('DO LANGUAGE plpgsql $$ … $$ is still a DO block',
+  BASE + 'DO LANGUAGE plpgsql $$\nBEGIN\n  ALTER TABLE orders DISABLE ROW LEVEL SECURITY;\nEND $$;\n', true);
+await rlsCase('CREATE UNLOGGED TABLE creates a table',
+  'CREATE UNLOGGED TABLE orders (id serial);\n', true);
+await rlsCase('a TEMP table is session-only and is not reported',
+  'CREATE TEMP TABLE scratch (id serial);\n', false);
+await rlsCase('FORCE ROW LEVEL SECURITY is understood as not toggling RLS (no false alarm)',
+  BASE + 'ALTER TABLE orders FORCE ROW LEVEL SECURITY;\n', false);
+
+await (async () => {
+  // Dynamic SQL cannot be interpreted statically. It must surface as partial
+  // coverage — an incomplete verdict — never be dropped as if it were not there.
+  const dir = fixture({ 'db/1.sql': BASE + "DO $$ BEGIN EXECUTE 'ALTER TABLE orders DISABLE ROW LEVEL SECURITY'; END $$;\n" });
+  const r = await scanStatic(dir);
+  const s = summarize(r.findings, r.runs);
+  check('EXECUTE with RLS text makes the RLS check partial and the gate incomplete', () => {
+    const run = r.runs.find((x) => x.id === 'static:rls-migrations');
+    assert.strictEqual(run?.status, 'partial', `run status was ${run?.status}`);
+    assert.match(run?.note ?? '', /could not be interpreted/);
+    assert.strictEqual(s.gate, 'incomplete');
+    assert.strictEqual(exitCodeFor(s), 3);
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // Negative half: EXECUTE that does not touch tables/RLS is not "unknown".
+  const dir2 = fixture({ 'db/1.sql': BASE + "DO $$ BEGIN EXECUTE 'NOTIFY channel'; END $$;\n" });
+  const r2 = await scanStatic(dir2);
+  check('EXECUTE unrelated to tables/RLS keeps the check complete', () => {
+    assert.strictEqual(r2.runs.find((x) => x.id === 'static:rls-migrations')?.status, 'completed');
+  });
+  rmSync(dir2, { recursive: true, force: true });
+})();
+
 // --- Liveness: every static detector must still FIRE on its own target -------
 // Three detectors were once silently disabled by "fix the false positive"
 // changes while the suite stayed green, because those tests only asserted that

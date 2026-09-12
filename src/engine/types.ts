@@ -67,9 +67,20 @@ export interface CheckerContext {
   detection: Detection;
 }
 
+/**
+ * A checker may report that it could not interpret part of its input. That is
+ * missing coverage, not a clean result: the run is recorded as `partial`, which
+ * makes the gate `incomplete`. Unknown must never read as clean.
+ */
+export interface CheckerResult {
+  findings: Finding[];
+  /** Why coverage is partial (shown to the user). Omit when complete. */
+  partial?: string;
+}
+
 export interface Checker {
   id: string;
   title: string;
   level: Level;
-  run(ctx: CheckerContext): Finding[] | Promise<Finding[]>;
+  run(ctx: CheckerContext): Finding[] | CheckerResult | Promise<Finding[] | CheckerResult>;
 }

@@ -85,30 +85,54 @@ function guardedRanges(ts: SqlToken[]): Array<[number, number]> {
  * DDL is analyzed as executed code while the surrounding file keeps its own
  * order. Returns the tokens plus the guarded index ranges.
  */
-function flatten(sql: string): { ts: SqlToken[]; guards: Array<[number, number]> } {
+function flatten(sql: string): { ts: SqlToken[]; guards: Array<[number, number]>; bodies: Array<[number, number]> } {
   const top = lexSql(sql).filter((t) => t.type !== 'comment');
   const ts: SqlToken[] = [];
   const guards: Array<[number, number]> = [];
+  /** Token index ranges that came from a DO body — plpgsql, not plain SQL. */
+  const bodies: Array<[number, number]> = [];
   for (let i = 0; i < top.length; i++) {
     const t = top[i] as SqlToken;
     // `DO $$ ... $$` is executed procedural code: lex its body and inline it.
-    if (t.type === 'dollarString' && isWord(top[i - 1], 'DO')) {
+    // `DO $$…$$`, `DO LANGUAGE plpgsql $$…$$` — the language clause may come first.
+    const beforeBody = isWord(top[i - 2], 'LANGUAGE') && top[i - 1]?.type === 'word' ? i - 3 : i - 1;
+    if (t.type === 'dollarString' && isWord(top[beforeBody], 'DO')) {
       const inner = lexSql(t.value, t.bodyStart ?? t.start).filter((x) => x.type !== 'comment');
       const base = ts.length;
       for (const [a, b] of guardedRanges(inner)) guards.push([base + a, base + b]);
       ts.push(...inner);
+      bodies.push([base, ts.length]);
       continue;
     }
     ts.push(t);
   }
-  return { ts, guards };
+  return { ts, guards, bodies };
 }
 
-/** Extract CREATE / ENABLE / DISABLE / DROP / SELECT INTO events from one file. */
+interface Unparsed { offset: number; why: string }
+interface Stmt { events: Omit<Event, 'file' | 'fileIdx' | 'line'>[]; unparsed: Unparsed[] }
+
+const isWordIn = (t: SqlToken | undefined, ws: string[]) => !!t && t.type === 'word' && ws.includes(t.value.toUpperCase());
+const isPunct = (t: SqlToken | undefined, p: string) => !!t && t.type === 'punct' && t.value === p;
+const RLS_TEXT = /row\s+level\s+security|create\s+(?:\w+\s+)*table\b|drop\s+table\b/i;
+
+/**
+ * Extract CREATE / ENABLE / DISABLE / DROP / SELECT INTO events from one file,
+ * statement by statement. Anything that could change a table's existence or
+ * RLS state and is NOT understood is returned in `unparsed` — it must surface
+ * as partial coverage, never vanish into a `continue`.
+ */
 function readStatements(sql: string): Stmt {
-  const { ts, guards } = flatten(sql);
+  const { ts, guards, bodies } = flatten(sql);
   const events: Stmt['events'] = [];
+  const unparsed: Unparsed[] = [];
   const guarded = (i: number) => guards.some(([a, b]) => i >= a && i < b);
+  const inBody = (i: number) => bodies.some(([a, b]) => i >= a && i < b);
+  // Inside plpgsql, `BEGIN ALTER TABLE …` and `IF x THEN ALTER TABLE …` are one
+  // `;`-terminated run whose real statement starts after the structure word.
+  // Only inside DO bodies: plain SQL uses THEN/ELSE/END in CASE expressions.
+  const PLPGSQL_BOUNDARY = ['BEGIN', 'DECLARE', 'THEN', 'ELSE', 'ELSIF', 'LOOP', 'END'];
+  const isBoundary = (i: number) => isPunct(ts[i], ';') || (inBody(i) && isWordIn(ts[i], PLPGSQL_BOUNDARY));
   const add = (
     kind: Event['kind'], schema: Name | undefined, table: Name, at: number, idx: number, ifNotExists = false,
   ) => events.push({
@@ -116,57 +140,114 @@ function readStatements(sql: string): Stmt {
     offset: at, conditional: guarded(idx),
   });
 
-  for (let i = 0; i < ts.length; i++) {
-    const t = ts[i] as SqlToken;
-    if (t.type !== 'word') continue;
-    const w = t.value.toUpperCase();
+  /** ENABLE|DISABLE ROW LEVEL SECURITY at `m`? Returns the verb or null. */
+  const rlsVerbAt = (m: number): 'enable' | 'disable' | null => {
+    const v = ts[m];
+    if (!v || v.type !== 'word') return null;
+    const V = v.value.toUpperCase();
+    if (V !== 'ENABLE' && V !== 'DISABLE') return null;
+    return isWord(ts[m + 1], 'ROW') && isWord(ts[m + 2], 'LEVEL') && isWord(ts[m + 3], 'SECURITY') ? (V === 'DISABLE' ? 'disable' : 'enable') : null;
+  };
+  const mentionsRls = (from: number, to: number) => {
+    for (let m = from; m + 2 < to; m++) if (isWord(ts[m], 'ROW') && isWord(ts[m + 1], 'LEVEL') && isWord(ts[m + 2], 'SECURITY')) return true;
+    return false;
+  };
 
-    if (w === 'CREATE' && isWord(ts[i + 1], 'TABLE')) {
-      const [j, ine] = skipIfExists(ts, i + 2);
-      const q = readQualified(ts, j);
-      if (q) add('create', q.schema, q.table, t.start, i, ine);
-      continue;
+  const interpret = (from: number, to: number) => {
+    const first = ts[from] as SqlToken;
+    const w = first.type === 'word' ? first.value.toUpperCase() : '';
+
+    if (w === 'CREATE') {
+      let j = from + 1;
+      let temp = false;
+      while (isWordIn(ts[j], ['UNLOGGED', 'TEMP', 'TEMPORARY', 'GLOBAL', 'LOCAL'])) {
+        if (/^TEMP/i.test((ts[j] as SqlToken).value)) temp = true;
+        j++;
+      }
+      if (!isWord(ts[j], 'TABLE')) return dynamic(from, to); // CREATE INDEX/POLICY/… — not a table
+      const [k, ine] = skipIfExists(ts, j + 1);
+      const q = readQualified(ts, k);
+      if (!q) return unparsed.push({ offset: first.start, why: 'CREATE TABLE with a table name the analyzer cannot read' });
+      // A TEMP table lives only in the creating session; PostgREST never sees it.
+      if (!temp) add('create', q.schema, q.table, first.start, from, ine);
+      return;
     }
 
-    if (w === 'DROP' && isWord(ts[i + 1], 'TABLE')) {
-      const [j] = skipIfExists(ts, i + 2);
-      const q = readQualified(ts, j);
-      if (q) add('drop', q.schema, q.table, t.start, i);
-      continue;
+    if (w === 'DROP' && isWord(ts[from + 1], 'TABLE')) {
+      const [k] = skipIfExists(ts, from + 2);
+      const q = readQualified(ts, k);
+      if (!q) return unparsed.push({ offset: first.start, why: 'DROP TABLE with a table name the analyzer cannot read' });
+      add('drop', q.schema, q.table, first.start, from);
+      return;
     }
 
-    if (w === 'ALTER' && isWord(ts[i + 1], 'TABLE')) {
-      // `ALTER TABLE [IF EXISTS] [ONLY] name ENABLE|DISABLE ROW LEVEL SECURITY`
-      let [j] = skipIfExists(ts, i + 2);
+    if (w === 'ALTER' && isWord(ts[from + 1], 'TABLE')) {
+      // ALTER TABLE [IF EXISTS] [ONLY] name [*] action [, action ...]
+      let [j] = skipIfExists(ts, from + 2);
       if (isWord(ts[j], 'ONLY')) j++;
       const q = readQualified(ts, j);
-      if (!q) continue;
+      if (!q) return unparsed.push({ offset: first.start, why: 'ALTER TABLE with a table name the analyzer cannot read' });
       let k = q.next;
-      if (isWord(ts[k], '*')) k++;
-      const verb = ts[k];
-      if (!verb || verb.type !== 'word') continue;
-      const v = verb.value.toUpperCase();
-      if ((v !== 'ENABLE' && v !== 'DISABLE') || !isWord(ts[k + 1], 'ROW') || !isWord(ts[k + 2], 'LEVEL') || !isWord(ts[k + 3], 'SECURITY')) continue;
-      add(v === 'DISABLE' ? 'disable' : 'enable', q.schema, q.table, t.start, i);
-      continue;
+      if (isPunct(ts[k], '*')) k++;
+      // Actions are comma-separated; an RLS toggle may be any of them, so scan
+      // the whole statement rather than only the first action.
+      let handled = false;
+      for (let m = k; m < to; m++) {
+        const verb = rlsVerbAt(m);
+        if (verb) { add(verb, q.schema, q.table, first.start, from); handled = true; m += 3; continue; }
+        // FORCE / NO FORCE ROW LEVEL SECURITY change owner bypass, not whether RLS is on.
+        if (isWord(ts[m], 'FORCE') && isWord(ts[m + 1], 'ROW')) { handled = true; m += 3; }
+      }
+      if (!handled && mentionsRls(k, to)) {
+        unparsed.push({ offset: first.start, why: 'ALTER TABLE mentions ROW LEVEL SECURITY in a form the analyzer does not understand' });
+      }
+      return;
     }
 
     if (w === 'SELECT') {
-      // `SELECT ... INTO <table>` creates a table. Stop at the statement end.
-      for (let k = i + 1; k < ts.length; k++) {
-        const u = ts[k] as SqlToken;
-        if (u.type === 'punct' && u.value === ';') break;
-        if (u.type === 'word' && u.value.toUpperCase() === 'FROM') break;
+      // `SELECT ... INTO <table>` creates a table.
+      for (let m = from + 1; m < to; m++) {
+        const u = ts[m] as SqlToken;
+        if (isWord(u, 'FROM')) break;
         if (isWord(u, 'INTO')) {
-          const q = readQualified(ts, k + 1);
-          if (q) add('create', q.schema, q.table, t.start, i);
+          const q = readQualified(ts, m + 1);
+          if (q) add('create', q.schema, q.table, first.start, from);
           break;
         }
       }
-      continue;
+      return;
+    }
+
+    return dynamic(from, to);
+  };
+
+  /**
+   * Dynamic SQL — `EXECUTE 'ALTER TABLE …'`, `EXECUTE format(…)` — builds the
+   * statement at run time. Its text is a string literal here, so it cannot be
+   * interpreted; if it talks about tables or RLS, say so instead of ignoring it.
+   */
+  const dynamic = (from: number, to: number) => {
+    let hasExecute = false;
+    for (let m = from; m < to; m++) if (isWord(ts[m], 'EXECUTE')) { hasExecute = true; break; }
+    if (!hasExecute) return;
+    for (let m = from; m < to; m++) {
+      const u = ts[m] as SqlToken;
+      if ((u.type === 'string' || u.type === 'dollarString') && RLS_TEXT.test(u.value)) {
+        unparsed.push({ offset: u.start, why: 'dynamic SQL (EXECUTE with a string) changes table/RLS state and cannot be interpreted statically' });
+        return;
+      }
+    }
+  };
+
+  // Split into statements and interpret each one.
+  let s = 0;
+  for (let i = 0; i <= ts.length; i++) {
+    if (i === ts.length || isBoundary(i)) {
+      if (i > s) interpret(s, i);
+      s = i + 1;
     }
   }
-  return { events };
+  return { events, unparsed };
 }
 
 /**
@@ -198,10 +279,11 @@ export const rlsMigrationsChecker: Checker = {
     if (otherEngine && !postgresish) return [];
 
     const events: Event[] = [];
+    const notUnderstood: string[] = [];
     sqlFiles.forEach((f, fileIdx) => {
-      for (const e of readStatements(f.content).events) {
-        events.push({ ...e, file: f.rel, fileIdx, line: lineAt(f.content, e.offset) });
-      }
+      const { events: evs, unparsed } = readStatements(f.content);
+      for (const e of evs) events.push({ ...e, file: f.rel, fileIdx, line: lineAt(f.content, e.offset) });
+      for (const u of unparsed) notUnderstood.push(`${f.rel}:${lineAt(f.content, u.offset)} — ${u.why}`);
     });
     // True apply order: by migration file, then by statement position in the file.
     events.sort((a, b) => a.fileIdx - b.fileIdx || a.offset - b.offset);
@@ -282,6 +364,12 @@ export const rlsMigrationsChecker: Checker = {
         line: s.line,
       });
     }
-    return findings;
+    if (notUnderstood.length === 0) return findings;
+    // Statements that can change table or RLS state and were not understood are
+    // missing coverage. Returning them as `partial` makes the verdict incomplete
+    // instead of letting an unknown construct read as clean.
+    const shown = notUnderstood.slice(0, 5).join('; ');
+    const more = notUnderstood.length > 5 ? ` (+${notUnderstood.length - 5} more)` : '';
+    return { findings, partial: `${notUnderstood.length} SQL statement(s) affecting table/RLS state could not be interpreted: ${shown}${more}` };
   },
 };

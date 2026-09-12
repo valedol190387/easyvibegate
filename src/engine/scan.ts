@@ -51,8 +51,15 @@ export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<
 
   for (const checker of staticCheckers) {
     try {
-      findings.push(...(await checker.run(ctx)));
-      runs.push({ id: `static:${checker.id}`, level: 0, status: 'completed' });
+      const res = await checker.run(ctx);
+      const { findings: got, partial } = Array.isArray(res) ? { findings: res, partial: undefined } : res;
+      findings.push(...got);
+      // A checker that could not interpret part of its input did not fully run.
+      runs.push(
+        partial
+          ? { id: `static:${checker.id}`, level: 0, status: 'partial', note: partial }
+          : { id: `static:${checker.id}`, level: 0, status: 'completed' },
+      );
     } catch (err) {
       // A broken checker is a failed check, not a clean pass.
       runs.push({
