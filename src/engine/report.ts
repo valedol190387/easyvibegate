@@ -6,6 +6,13 @@ import { t, type Lang } from './i18n.js';
 import { VERSION } from './version.js';
 
 const WEIGHTS: Record<Severity, number> = { critical: 25, warning: 8, info: 2, advisory: 0 };
+/**
+ * How many findings of a severity may move the score. Beyond the cap the count
+ * still shows in the report, but the grade stops falling: 562 warnings once
+ * produced 0/100 next to a project with real critical leaks at the same 0/100,
+ * which told the reader nothing. Criticals can still zero the score.
+ */
+const SCORE_CAP: Record<Severity, number> = { critical: 4, warning: 5, info: 5, advisory: 0 };
 const EMOJI: Record<Severity, string> = { critical: '🔴', warning: '🟡', info: '🔵', advisory: '⚪' };
 
 export interface Coverage {
@@ -50,9 +57,11 @@ export interface Summary {
 export function summarize(findings: Finding[], runs: CheckRun[] = []): Summary {
   const counts: Record<Severity, number> = { critical: 0, warning: 0, info: 0, advisory: 0 };
   let score = 100;
+  const counted: Record<Severity, number> = { critical: 0, warning: 0, info: 0, advisory: 0 };
   for (const f of findings) {
     counts[f.severity]++;
-    score -= WEIGHTS[f.severity];
+    if (counted[f.severity] < SCORE_CAP[f.severity]) score -= WEIGHTS[f.severity];
+    counted[f.severity]++;
   }
   const cov = coverage(runs);
   const gate: Gate =

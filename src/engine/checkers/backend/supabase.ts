@@ -1,6 +1,6 @@
 import type { CheckRun, Finding, ScanFile, Severity } from '../../types.js';
 import { decodeJwtPayload } from '../../util/text.js';
-import { isErr, request, sleep, unreliable } from '../../net/http.js';
+import { classifyBody, isErr, request, sleep } from '../../net/http.js';
 
 export interface SupabaseCreds {
   url: string;
@@ -9,10 +9,20 @@ export interface SupabaseCreds {
   keyKind: 'jwt-anon' | 'publishable';
   /** Where the URL/key were found (for display). */
   source?: string;
+  /**
+   * URL and key did not come from the same file, so they may belong to
+   * different environments. `source` names both files; callers should show it
+   * before probing rather than present the pair as one discovered config.
+   */
+  ambiguous?: true;
 }
 
 const URL_ASSIGN = /(?:NEXT_PUBLIC_|VITE_|PUBLIC_)?SUPABASE(?:_PUBLIC)?_URL\s*[:=]\s*["'`]?(https?:\/\/[^"'`\s]+)/i;
 const ANON_ASSIGN = /(?:NEXT_PUBLIC_|VITE_|PUBLIC_)?SUPABASE_(?:ANON|PUBLISHABLE)_KEY\s*[:=]\s*["'`]?([A-Za-z0-9._-]{20,})/i;
+// Docs and templates hold example values, not the running config.
+const NOT_CONFIG = /\.(md|mdx|txt|rst)$|\.(example|sample|template|dist)$/i;
+// Next.js load order for a production build — the most specific file wins.
+const ENV_ORDER = ['.env.production.local', '.env.local', '.env.production', '.env'];
 
 export function classifyKey(key: string): 'jwt-anon' | 'jwt-authenticated' | 'jwt-service' | 'publishable' | 'secret' | 'unknown' {
   if (key.startsWith('sb_publishable_')) return 'publishable';
@@ -25,46 +35,62 @@ export function classifyKey(key: string): 'jwt-anon' | 'jwt-authenticated' | 'jw
   return 'unknown';
 }
 
-/** Find a Supabase URL + a *public* key (anon JWT or publishable) in the project. */
+const BARE_URL = /https:\/\/[a-z0-9]{16,}\.supabase\.co/;
+const BARE_PUBLISHABLE = /\bsb_publishable_[A-Za-z0-9_-]{10,}\b/;
+const BARE_JWT = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
+
+function isPublicKey(key: string): boolean {
+  const kind = classifyKey(key);
+  return kind === 'jwt-anon' || kind === 'publishable';
+}
+
+/**
+ * The URL and *public* key ONE file declares — an explicit assignment first, a
+ * bare literal as fallback. Never an authenticated/service key.
+ */
+function credsInFile(content: string): { url?: string; key?: string } {
+  const url = content.match(URL_ASSIGN)?.[1] ?? content.match(BARE_URL)?.[0];
+  let key = content.match(ANON_ASSIGN)?.[1];
+  if (key && !isPublicKey(key)) key = undefined;
+  key ??= content.match(BARE_PUBLISHABLE)?.[0]
+    ?? [...content.matchAll(BARE_JWT)].map((m) => m[0]).find((k) => classifyKey(k) === 'jwt-anon');
+  return { url, key };
+}
+
+function envRank(rel: string): number {
+  const i = ENV_ORDER.indexOf(rel.split('/').pop() ?? rel);
+  return i === -1 ? ENV_ORDER.length : i;
+}
+
+/**
+ * Find a Supabase URL + a *public* key (anon JWT or publishable) in the project.
+ * URL and key are paired by provenance: a file holding both wins (env files in
+ * load order first). Only when no single file has both do we fall back to a
+ * URL from one file and a key from another — flagged `ambiguous`, because the
+ * two may belong to different environments and must never be presented as one
+ * discovered config.
+ */
 export function discoverSupabase(files: Pick<ScanFile, 'content' | 'rel'>[]): SupabaseCreds | null {
-  // Skip docs when discovering credentials so we don't mix an example URL with a real key.
-  const scannable = files.filter((f) => !f.rel.endsWith('.md') && !f.rel.endsWith('.txt'));
+  const scannable = files
+    .filter((f) => !NOT_CONFIG.test(f.rel))
+    .map((f) => ({ rel: f.rel, ...credsInFile(f.content) }))
+    .sort((a, b) => envRank(a.rel) - envRank(b.rel)); // stable: ties keep scan order
 
-  let url: string | undefined;
-  let anonKey: string | undefined;
-  let source: string | undefined;
-
-  for (const f of scannable) {
-    const u = f.content.match(URL_ASSIGN)?.[1];
-    if (u && !url) { url = u; source = f.rel; }
-    const k = f.content.match(ANON_ASSIGN)?.[1];
-    if (k && !anonKey && ['publishable', 'jwt-anon'].includes(classifyKey(k))) anonKey = k;
-    if (url && anonKey) break;
-  }
-
-  if (!url) {
-    for (const f of scannable) {
-      const m = f.content.match(/https:\/\/[a-z0-9]{16,}\.supabase\.co/);
-      if (m) { url = m[0]; source ??= f.rel; break; }
-    }
-  }
-  if (!anonKey) {
-    // Only a genuine anon key or publishable key — never authenticated/service.
-    outer: for (const f of scannable) {
-      for (const m of f.content.matchAll(/\bsb_publishable_[A-Za-z0-9_-]{10,}\b/g)) { anonKey = m[0]; break outer; }
-      for (const m of f.content.matchAll(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g)) {
-        if (classifyKey(m[0]) === 'jwt-anon') { anonKey = m[0]; break outer; }
-      }
-    }
-  }
-
-  if (!url || !anonKey) return null;
-  return {
+  const make = (url: string, anonKey: string, source: string, ambiguous?: true): SupabaseCreds => ({
     url: url.replace(/\/+$/, ''),
     anonKey,
     keyKind: classifyKey(anonKey) === 'publishable' ? 'publishable' : 'jwt-anon',
     source,
-  };
+    ...(ambiguous ? { ambiguous } : {}),
+  });
+
+  const paired = scannable.find((f) => f.url && f.key);
+  if (paired?.url && paired.key) return make(paired.url, paired.key, paired.rel);
+
+  const urlFile = scannable.find((f) => f.url);
+  const keyFile = scannable.find((f) => f.key);
+  if (!urlFile?.url || !keyFile?.key) return null;
+  return make(urlFile.url, keyFile.key, `${urlFile.rel} (URL) + ${keyFile.rel} (key)`, true);
 }
 
 export interface ProbeResult {
@@ -114,17 +140,36 @@ function parseCount(headers: Headers): number | null {
   return Number.isNaN(n) ? null : n;
 }
 
+interface OpenApiDoc {
+  definitions?: Record<string, unknown>;
+  components?: { schemas?: Record<string, unknown> };
+  paths?: Record<string, unknown>;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+/**
+ * PostgREST answers /rest/v1/ with an OpenAPI 2/3 document. Any other JSON
+ * (`{"error":…}` from a gateway, a maintenance page's payload) is NOT an empty
+ * schema — treating it as one would turn an outage into "zero tables exposed".
+ */
+function asOpenApi(v: unknown): OpenApiDoc | null {
+  if (!isPlainObject(v)) return null;
+  const schemas = isPlainObject(v['components']) ? v['components']['schemas'] : undefined;
+  if (!isPlainObject(v['definitions']) && !isPlainObject(schemas) && !isPlainObject(v['paths'])) return null;
+  return v as OpenApiDoc;
+}
+
 async function enumerate(creds: SupabaseCreds): Promise<{ tables: string[]; rpc: string[] } | { error: string }> {
   const res = await request(`${creds.url}/rest/v1/`, { headers: authHeaders(creds.anonKey) });
-  if (isErr(res)) return { error: res.error };
-  if (res.status === 401 || res.status === 403) return { error: `anon key rejected (HTTP ${res.status})` };
-  if (res.status >= 400) return { error: `PostgREST returned HTTP ${res.status}` };
-  let spec: { definitions?: Record<string, unknown>; components?: { schemas?: Record<string, unknown> }; paths?: Record<string, unknown> };
-  try {
-    spec = JSON.parse(res.body);
-  } catch {
-    return { error: 'PostgREST did not return an OpenAPI document' };
-  }
+  const verdict = classifyBody(res, 'json');
+  if (verdict.kind === 'denied') return { error: `anon key rejected (${verdict.reason})` };
+  // Redirect, 5xx, truncated body, HTML, error envelope, empty JSON: the schema was not enumerated.
+  if (verdict.kind !== 'data') return { error: `could not enumerate the PostgREST schema (${verdict.reason})` };
+  const spec = asOpenApi(verdict.json);
+  if (!spec) return { error: 'PostgREST did not return an OpenAPI document — schema enumeration failed' };
   const schemas = { ...(spec.definitions ?? {}), ...(spec.components?.schemas ?? {}) };
   let tables = Object.keys(schemas);
   const paths = Object.keys(spec.paths ?? {});
@@ -175,7 +220,7 @@ export async function probeSupabase(opts: ProbeOptions): Promise<ProbeResult> {
   const { tables, rpc } = enumerated;
   log(`Supabase: ${tables.length} table(s), ${rpc.length} rpc function(s) exposed to PostgREST`);
 
-  let errored = 0;
+  const lost: string[] = []; // sub-checks that produced no verdict, for the note
   for (const table of tables) {
     await sleep(rl);
     // HEAD + count=exact returns only the row count in a header — no data pulled.
@@ -184,10 +229,11 @@ export async function probeSupabase(opts: ProbeOptions): Promise<ProbeResult> {
       headers: { ...authHeaders(creds.anonKey), Prefer: 'count=exact', Range: '0-0', 'Range-Unit': 'items' },
     });
     // 5xx/429/timeout AND 3xx (a login redirect) mean we learned nothing here.
-    if (isErr(res) || res.status === 429 || res.status >= 500 || (res.status >= 300 && res.status < 400)) { errored++; continue; }
+    if (isErr(res)) { lost.push(`${table} (${res.error})`); continue; }
+    if (res.status === 429 || res.status >= 500 || (res.status >= 300 && res.status < 400)) { lost.push(`${table} (HTTP ${res.status})`); continue; }
     if (res.status === 200 || res.status === 206) {
       const count = parseCount(res.headers);
-      if (count === null) { errored++; continue; } // no usable count → inconclusive, not proof
+      if (count === null) { lost.push(`${table} (no content-range)`); continue; } // no usable count → inconclusive, not proof
       if (count > 0) {
         const sev = severityForTable(table);
         findings.push({
@@ -212,28 +258,30 @@ export async function probeSupabase(opts: ProbeOptions): Promise<ProbeResult> {
   // Storage buckets listable by anon.
   await sleep(rl);
   const buckets = await request(`${creds.url}/storage/v1/bucket`, { headers: authHeaders(creds.anonKey) });
-  let storageErrored = unreliable(buckets);
-  if (!isErr(buckets) && buckets.status === 200) {
-    try {
-      const parsed = JSON.parse(buckets.body) as unknown;
-      const list = (Array.isArray(parsed) ? parsed : (parsed as { buckets?: unknown })?.buckets) as
-        Array<string | { name?: string; id?: string; public?: boolean }> | undefined;
-      if (!Array.isArray(list)) throw new Error('unrecognized bucket listing');
-      if (list.length > 0) {
-        const objs = list.map((b) => (typeof b === 'string' ? { name: b } : b));
-        const publicOnes = objs.filter((b) => b.public).map((b) => b.name ?? b.id ?? '(unnamed)').join(', ');
-        findings.push({
-          id: 'supabase_bucket_listing',
-          severity: publicOnes ? 'critical' : 'warning',
-          title: 'Storage buckets are listable by anyone',
-          detail: `The public key can list ${list.length} storage bucket(s)${publicOnes ? `; public: ${publicOnes}` : ''}.`,
-          fix: 'Restrict bucket listing and mark buckets private unless public access is intentional; add storage RLS policies.',
-          checker: 'supabase-probe',
-          level: 2,
-          endpoint: 'GET /storage/v1/bucket',
-        });
-      }
-    } catch { storageErrored = true; } // a 200 we cannot parse is a lost sub-check
+  // One classifier for every probe: a redirect, a truncated or non-JSON 200, an
+  // error envelope — none of them says "no buckets". 401/403/404 and `[]` do.
+  const bv = classifyBody(buckets, 'json');
+  if (bv.kind === 'unknown') lost.push(`storage (${bv.reason})`);
+  if (bv.kind === 'data') {
+    const parsed = bv.json;
+    const list = (Array.isArray(parsed) ? parsed : (parsed as { buckets?: unknown })?.buckets) as
+      Array<string | { name?: string; id?: string; public?: boolean }> | undefined;
+    if (!Array.isArray(list)) {
+      lost.push('storage (unrecognized bucket listing)'); // a 200 we cannot read is a lost sub-check
+    } else if (list.length > 0) {
+      const objs = list.map((b) => (typeof b === 'string' ? { name: b } : b));
+      const publicOnes = objs.filter((b) => b.public).map((b) => b.name ?? b.id ?? '(unnamed)').join(', ');
+      findings.push({
+        id: 'supabase_bucket_listing',
+        severity: publicOnes ? 'critical' : 'warning',
+        title: 'Storage buckets are listable by anyone',
+        detail: `The public key can list ${list.length} storage bucket(s)${publicOnes ? `; public: ${publicOnes}` : ''}.`,
+        fix: 'Restrict bucket listing and mark buckets private unless public access is intentional; add storage RLS policies.',
+        checker: 'supabase-probe',
+        level: 2,
+        endpoint: 'GET /storage/v1/bucket',
+      });
+    }
   }
 
   if (rpc.length > 0) {
@@ -249,8 +297,10 @@ export async function probeSupabase(opts: ProbeOptions): Promise<ProbeResult> {
   }
 
   const attempted = tables.length + 1; // tables + storage
-  const totalErr = errored + (storageErrored ? 1 : 0);
+  const totalErr = lost.length;
   const status = totalErr === 0 ? 'completed' : totalErr < attempted ? 'partial' : 'failed';
-  const note = totalErr > 0 ? `${totalErr}/${attempted} probe requests errored (5xx/429/timeout)` : undefined;
+  const note = totalErr > 0
+    ? `${totalErr}/${attempted} probe(s) not verified: ${lost.slice(0, 5).join(', ')}${totalErr > 5 ? ', …' : ''}`
+    : undefined;
   return { findings, run: { id: 'supabase-probe', level: 2, status, note } };
 }

@@ -72,6 +72,8 @@ const EN: Dict = {
   'wiz.urlInvalid': '"{input}" is not a valid address. Use e.g. https://myapp.com, or press Enter to skip.',
   'wiz.answerUnclear': 'Please answer y or n (got "{input}").',
   'wiz.qOwn': '  Confirm {url} is YOUR app and you allow live requests to it?',
+  'wiz.sbFromFlag': '  Supabase target from the command line: {url}',
+  'wiz.notRun': '  Not confirmed — {target} will be listed as a requested check that did not run.',
   // ai-fix
   'aifix.title': '# Security fix task for this codebase',
   'aifix.intro': 'You are a senior application-security engineer. EasyVibeGate scanned this project and found {crit} critical and {warn} warning issue(s) (score {score}/100, gate {gate}). Fix them one by one, most severe first, without breaking existing functionality.',
@@ -159,6 +161,8 @@ const RU: Dict = {
   'wiz.urlInvalid': '«{input}» — это не похоже на адрес. Например: https://myapp.com, или Enter чтобы пропустить.',
   'wiz.answerUnclear': 'Ответь «д» или «н» (получено «{input}»).',
   'wiz.qOwn': '  Подтверди: {url} — ТВОЁ приложение и ты разрешаешь слать к нему запросы?',
+  'wiz.sbFromFlag': '  Supabase из командной строки: {url}',
+  'wiz.notRun': '  Не подтверждено — {target} попадёт в отчёт как запрошенная, но не выполненная проверка.',
   'aifix.title': '# Задача: починить безопасность этого проекта',
   'aifix.intro': 'Ты — старший инженер по безопасности приложений. EasyVibeGate просканировал проект и нашёл {crit} критичных и {warn} предупреждений (оценка {score}/100, итог {gate}). Чини их по одному, начиная с самых серьёзных, не ломая существующую функциональность.',
   'aifix.rules': 'Правила',

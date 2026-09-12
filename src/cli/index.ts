@@ -2,7 +2,9 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
-import { runFlow, type ConsentRequest } from '../orchestrator/flow.js';
+import { planTargets, runFlow, type ConsentRequest } from '../orchestrator/flow.js';
+import { scanStatic } from '../engine/scan.js';
+import { loadConfig, validateConfigFile } from '../engine/config.js';
 import {
   badgeMarkdown,
   exitCodeFor,
@@ -151,8 +153,11 @@ function parseArgs(argv: string[]): Args {
         const v = need('--idor-tokens');
         if (v === undefined) break;
         const parts = v.split(',').map((s) => s.trim()).filter(Boolean);
-        if (parts.length === 2) a.idorTokens = [parts[0]!, parts[1]!];
-        else a.badIdorTokens = true;
+        if (parts.length !== 2) a.badIdorTokens = true;
+        // Two identical tokens are one identity: the differential could never
+        // observe cross-user access, so the check would silently prove nothing.
+        else if (parts[0] === parts[1]) a.argErrors.push('--idor-tokens needs two DIFFERENT tokens (two accounts) — identical tokens cannot test cross-user access');
+        else a.idorTokens = [parts[0]!, parts[1]!];
         break;
       }
       default:
@@ -247,6 +252,7 @@ async function main(): Promise<void> {
   let result;
   if (useWizard) {
     result = await runWizard({
+      excludeAbs: [outDir],
       path: args.path,
       config: args.config,
       lang,
@@ -269,14 +275,21 @@ async function main(): Promise<void> {
       const ans = await ask(color.yellow(`  Probe ${req.kind} → ${req.target}?\n    (${req.detail}) [y/N] `));
       return /^y(es)?$/i.test(ans.trim());
     };
-    result = await runFlow({
-      root,
-      configPath: args.config,
+    // Same contract as the wizard: plan the concrete targets once, ask about
+    // exactly those, execute exactly those.
+    const staticResult = await scanStatic(root, { configPath: args.config, excludeAbs: [outDir] });
+    const plan = planTargets(staticResult.files, loadConfig(root, args.config), {
       appUrl: args.appUrl,
       supabaseUrl: args.supabaseUrl,
       supabaseKey: args.supabaseKey,
-      runDeps: args.deps,
       idorTokens: args.idorTokens,
+    });
+    result = await runFlow({
+      root,
+      configPath: args.config,
+      runDeps: args.deps,
+      precomputedStatic: staticResult,
+      plan,
       consent,
       log,
     });
@@ -337,29 +350,6 @@ function prepareOutputDir(dir: string): string | null {
   }
 }
 
-/** Returns a human message when an explicitly given config is unusable. */
-function validateConfigFile(path: string): string | null {
-  if (!existsSync(path)) return 'file not found';
-  if (!statSync(path).isFile()) return 'not a file';
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(path, 'utf8'));
-  } catch (e) {
-    return `invalid JSON (${e instanceof Error ? e.message : String(e)})`;
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return 'must be a JSON object';
-  const cfg = parsed as Record<string, unknown>;
-  const known = ['ignore', 'ignorePaths'];
-  for (const key of known) {
-    const v = cfg[key];
-    if (v === undefined) continue;
-    if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) return `"${key}" must be an array of strings`;
-  }
-  // A typo like "ignorePath" would silently do nothing — say so instead.
-  const unknown = Object.keys(cfg).filter((k) => !known.includes(k));
-  if (unknown.length) return `unknown key(s): ${unknown.join(', ')} (expected ${known.join(', ')})`;
-  return null;
-}
 
 main().catch((err) => {
   process.stderr.write(`easyvibegate: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`);

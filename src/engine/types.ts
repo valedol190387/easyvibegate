@@ -56,7 +56,10 @@ export interface Detection {
   frameworks: string[];
   backends: string[];
   languages: string[];
+  /** Declared manager first (`packageManager` field), then lockfile-detected ones. */
   packageManagers: string[];
+  /** The `packageManager` field of package.json, when it names a known manager. */
+  declaredPackageManager?: string;
   hasEnv: boolean;
   hasGitignore: boolean;
 }

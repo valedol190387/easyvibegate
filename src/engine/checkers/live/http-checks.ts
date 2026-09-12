@@ -1,5 +1,5 @@
 import type { CheckRun, Finding } from '../../types.js';
-import { isErr, request, requestFollow, unreliable } from '../../net/http.js';
+import { classifyBody, isErr, looksLikeHtml, requestFollow, unreliable } from '../../net/http.js';
 
 export interface LiveResult {
   findings: Finding[];
@@ -36,23 +36,32 @@ const SECURITY_HEADERS: HeaderCheck[] = [
   { header: 'x-content-type-options', id: 'missing_xcto', title: 'Missing X-Content-Type-Options' },
 ];
 
-function looksLikeHtml(body: string): boolean {
-  return /<!doctype html|<html[\s>]/i.test(body.slice(0, 400));
-}
-
 /** Passive live checks on a deployed URL: exposed files + security headers. */
 export async function checkLiveSite(appUrl: string): Promise<LiveResult> {
   const base = appUrl.replace(/\/$/, '');
   const findings: Finding[] = [];
 
-  // Track every file probe: a timeout/5xx/429 there is a lost sub-check, not "file absent".
-  let fileErrors = 0;
+  // Track every file probe: a lost sub-check (timeout/5xx/429, a redirect we could
+  // not follow, a truncated body) is NOT "file absent" — it goes in the note.
+  const fileUnverified: string[] = [];
   for (const probe of EXPOSED) {
-    const res = await request(`${base}/${probe.path}`);
-    if (isErr(res) || res.status === 429 || res.status >= 500) { fileErrors++; continue; }
-    if (res.status !== 200) continue; // 404 etc. = that file is simply not served
-    if (looksLikeHtml(res.body)) continue; // SPA catch-all, not the real file
-    if (!probe.signature.test(res.body)) continue;
+    // A GET of a static file is safe to follow: the file may sit behind a same-origin
+    // hop (e.g. `/.env` → `/files/.env`). A hop off the origin is refused and lands
+    // below as unknown, so a redirect is never taken as evidence of absence.
+    const res = await requestFollow(`${base}/${probe.path}`);
+    const verdict = classifyBody(res, 'any');
+    // 4xx (absent/denied) and an empty 2xx are real answers: no file content was handed out.
+    if (verdict.kind === 'absent' || verdict.kind === 'denied' || verdict.kind === 'empty') continue;
+    const twoXx = !isErr(res) && res.status >= 200 && res.status < 300;
+    if (twoXx && looksLikeHtml(res.body)) continue; // SPA catch-all, not the real file
+    // A 2xx body carrying the signature is positive evidence even when truncated —
+    // the cap does not make a leaked file un-leaked.
+    const served = twoXx && probe.signature.test(res.body);
+    if (!served) {
+      // Truncated without a signature, a redirect off the origin, a 5xx…: not verified.
+      if (verdict.kind === 'unknown') fileUnverified.push(`/${probe.path} (${verdict.reason})`);
+      continue;
+    }
     findings.push({
       id: `exposed_${probe.path.replace(/[^a-z0-9]/gi, '_')}`,
       severity: probe.severity,
@@ -123,10 +132,11 @@ export async function checkLiveSite(appUrl: string): Promise<LiveResult> {
   // losing all of them = failed.
   const rootBad = unreliable(root) || (!isErr(root) && (root.status < 200 || root.status >= 300));
   const truncated = !isErr(root) && root.truncated === true;
+  const fileErrors = fileUnverified.length;
   const status = rootBad && fileErrors === EXPOSED.length ? 'failed' : rootBad || fileErrors > 0 || truncated ? 'partial' : 'completed';
   const notes: string[] = [];
   if (rootBad) notes.push(isErr(root) ? `could not reach ${base}/: ${root.error}` : `no usable 2xx page (HTTP ${root.status}) at ${base}/`);
-  if (fileErrors > 0) notes.push(`${fileErrors}/${EXPOSED.length} exposed-file probes errored`);
+  if (fileErrors > 0) notes.push(`${fileErrors}/${EXPOSED.length} exposed-file probes not verified: ${fileUnverified.slice(0, 4).join(', ')}${fileErrors > 4 ? ', …' : ''}`);
   if (!isErr(root) && root.truncated) notes.push('response body hit the 2 MB cap — content past it was not inspected');
   return { findings, run: { id: 'live-site', level: 2, status, note: notes.length ? notes.join('; ') : undefined } };
 }

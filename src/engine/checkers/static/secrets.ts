@@ -1,5 +1,6 @@
 import type { Checker, Finding, Severity } from '../../types.js';
 import { decodeJwtPayload, lineAt, looksLikePlaceholder, redact, shannonEntropy } from '../../util/text.js';
+import { createExposure, type Exposure } from '../../util/git-exposure.js';
 
 interface Pattern {
   id: string;
@@ -16,6 +17,44 @@ function looksRandom(s: string): boolean {
   const body = s.replace(/^[a-z]+[-_]/i, '');
   return /[A-Z]/.test(body) && /[0-9]/.test(body) && shannonEntropy(body) >= 3.2;
 }
+
+/**
+ * Detectors whose match is key MATERIAL by structure (a vendor prefix plus a
+ * random body, a PEM block, a DB password), as opposed to the name-based
+ * heuristics (generic_secret / env_secret). A hit from one of these in a
+ * docs/fixtures path is still a leak if the value is real — a fresh RSA key
+ * pasted into docs/deploy.md was once downgraded to info and PASSed the gate.
+ */
+const HIGH_CONFIDENCE = new Set([
+  'openai_key', 'anthropic_key', 'aws_key', 'stripe_live', 'github_token', 'slack_token',
+  'sendgrid_key', 'hf_token', 'npm_token', 'db_url_password', 'supabase_secret_key', 'private_key',
+]);
+
+const PEM_END = /-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/;
+
+/**
+ * Whether a high-confidence hit has the body of a real credential, so a
+ * docs/example path alone must not silence it. Anything obviously hand-typed
+ * (a PEM with no base64 body, a DB URL whose password is a plain word, a key
+ * with no digits) is treated as a sample and may still go to info.
+ */
+function looksLikeRealMaterial(id: string, hit: string, content: string, index: number, group?: string): boolean {
+  if (id === 'private_key') {
+    // The regex only matches the header; the material is what follows it.
+    const rest = content.slice(index + hit.length);
+    const endAt = rest.search(PEM_END);
+    const body = (endAt >= 0 ? rest.slice(0, endAt) : rest.slice(0, 4096)).replace(/\s+/g, '');
+    return body.length >= 64 && /^[A-Za-z0-9+/=]+$/.test(body);
+  }
+  if (id === 'db_url_password') {
+    const pw = group ?? '';
+    return /[0-9]/.test(pw) && /[A-Za-z]/.test(pw) && shannonEntropy(pw) >= 3.0;
+  }
+  if (id === 'aws_key') return /[0-9]/.test(hit);
+  return looksRandom(hit);
+}
+
+const DEFAULT_PASSWORDS = new Set(['postgres', 'password', 'passw0rd', 'secret', 'root', 'admin', 'test', 'dev', 'changeme', 'example', 'mysql', 'redis', 'mongo', 'user', 'guest', '123456', '12345678']);
 
 const PATTERNS: Pattern[] = [
   {
@@ -104,6 +143,20 @@ const PATTERNS: Pattern[] = [
     re: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|mssql):\/\/[^\s:/@"']+:([^\s:/@"']{4,})@[^\s"']+/gi,
     severity: 'critical',
     fix: 'Move the connection string to a server-side env var and rotate the database password — a committed DB URL grants full data access.',
+    // `postgres://opencut:opencut@localhost` in docker-compose / CI / a Dockerfile
+    // is a local container's default login, not a credential. A password that
+    // equals the user name, or is a well-known default, is never reported; a
+    // weak password on a local/single-label host (a compose service name) is
+    // not either. A real-looking password on a real host still is.
+    validate: (hit) => {
+      const m = /^[a-z+]+:\/\/([^\s:/@"']+):([^\s:/@"']+)@([^/\s:"']+)/i.exec(hit);
+      if (!m) return true;
+      const [, user = '', pw = '', host = ''] = m;
+      if (pw.toLowerCase() === user.toLowerCase() || DEFAULT_PASSWORDS.has(pw.toLowerCase())) return false;
+      const local = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|host\.docker\.internal|[a-z0-9_-]+)$/i.test(host);
+      const strong = /[0-9]/.test(pw) && /[A-Za-z]/.test(pw) && shannonEntropy(pw) >= 3.0;
+      return !(local && !strong);
+    },
   },
   {
     id: 'supabase_secret_key',
@@ -121,7 +174,16 @@ const PATTERNS: Pattern[] = [
   },
 ];
 
-const GENERIC = /(?:api[_-]?key|secret|token|passwd|password|pwd|auth[_-]?token|access[_-]?token|client[_-]?secret|credential)["']?\s*[:=]\s*["']([^"']{8,})["']/gi;
+const GENERIC = /\b([A-Za-z0-9_-]*(?:api[_-]?key|secret|token|passwd|password|pwd|credential))["']?\s*[:=]\s*["']([^"']{8,})["']/gi;
+/**
+ * Names that contain "token"/"secret" but are not credentials: API cursors,
+ * tracking ids, CSRF nonces, push tokens. 559 of 569 generic hits in one real
+ * project were `tracking_token` / `pagination_token` inside cached API
+ * responses.
+ */
+const NON_SECRET_NAME = /(pagination|tracking|page|next|prev|continuation|cursor|csrf|xsrf|cancel|request|device|push|fcm|expo|invite|share|verification|unsubscribe|reset|confirm|session)/i;
+/** Base64 blobs (thumbnails, binary) and anything longer than a real token. */
+const looksLikeBlob = (v: string) => v.length > 200 || /^(\/9j\/|iVBOR|data:|R0lGOD|UklGR)/.test(v);
 
 const JWT = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
 
@@ -158,22 +220,92 @@ export const secretsChecker: Checker = {
   level: 0,
   run(ctx) {
     const findings: Finding[] = [];
+    const exposure = createExposure(ctx.root);
+
+    // Values from the REAL env files, per directory. A committed .env.example
+    // that carries the same value as its sibling .env is not an example — it is
+    // the key, published. (Seen in the wild: OPENAI/ANTHROPIC keys identical
+    // in .env and a committed .env.example.)
+    const realEnvValues = new Map<string, Set<string>>();
+    for (const f of ctx.files) {
+      if (!isEnvFile(f.rel)) continue;
+      const dir = f.rel.includes('/') ? f.rel.slice(0, f.rel.lastIndexOf('/')) : '';
+      const set = realEnvValues.get(dir) ?? new Set<string>();
+      for (const m of f.content.matchAll(ASSIGN)) {
+        const v = (m[2] ?? '').trim().replace(/^["']|["']$/g, '').replace(/["'].*$/, '');
+        if (v.length >= 8) set.add(v);
+      }
+      realEnvValues.set(dir, set);
+    }
+    const dirOf = (rel: string) => (rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '');
+    const isExampleEnv = (rel: string) => /(^|\/)\.env[^/]*\.(example|sample|template|dist)$/i.test(rel) || /(^|\/)(example|sample)\.env$/i.test(rel);
 
     for (const file of ctx.files) {
       const { rel } = file;
       const content = file.content.replace(/^\uFEFF/, ''); // a BOM must not eat line 1
       const env = isEnvFile(rel);
       const example = isExampleContext(rel);
+      const ex: Exposure = exposure(rel);
 
-      const push = (f: Finding) => {
-        if (example) {
-          findings.push({
+      // `proven` = the hit is structurally real key material (see
+      // looksLikeRealMaterial). A docs/fixture path may only downgrade a
+      // heuristic or sample-looking hit to info; proven material stays at
+      // warning there — the path lowers confidence, it does not make it safe.
+      const rank: Record<Severity, number> = { critical: 0, warning: 1, info: 2, advisory: 3 };
+      const atMost = (sev: Severity, cap: Severity): Severity => (rank[sev] < rank[cap] ? cap : sev);
+
+      /**
+       * Severity = what the value is × how it can leak. The pattern says what it
+       * is; the example/docs path lowers confidence; git exposure decides how
+       * bad it is. `raw` is the unredacted value, only compared, never stored.
+       */
+      const push = (f: Finding, proven = false, raw?: string) => {
+        let out: Finding = f;
+        const realValueInExample = !!raw && isExampleEnv(rel) && (realEnvValues.get(dirOf(rel))?.has(raw) ?? false);
+        if (realValueInExample) {
+          // Not an example at all: the live value copied into the example file.
+          out = {
+            ...f,
+            severity: ex === 'committed' ? 'critical' : 'warning',
+            title: `${f.title} — the REAL value from .env, in an example file${ex === 'committed' ? ' that is committed' : ''}`,
+            detail: `${f.detail} This value is identical to the one in the sibling .env: the example file carries the real credential${ex === 'committed' ? ', and it is committed to git' : ''}.`,
+            fix: 'Replace the value in the example file with a placeholder, and rotate the credential — it has been published.',
+          };
+        } else if (example && proven) {
+          out = {
+            ...f,
+            severity: f.severity === 'critical' ? 'warning' : f.severity,
+            title: `${f.title} (in docs/example path — looks real)`,
+            detail: `${f.detail} The path suggests documentation or a fixture, but the value has the structure of real key material — verify it, and rotate it if it is genuine.`,
+          };
+        } else if (example) {
+          out = {
             ...f,
             severity: 'info',
             title: `${f.title} (in docs/example file)`,
             detail: `${f.detail} This looks like documentation or a fixture — confirm it is not a real credential.`,
-          });
-        } else findings.push(f);
+          };
+        }
+        // Git exposure. A committed secret keeps its full severity. Everything
+        // else cannot leak through the repository right now: an ignored file is
+        // doing exactly what it should (advisory); an untracked file in a repo
+        // or a folder that is not a repo is hygiene, capped at warning.
+        if (!realValueInExample && out.severity !== 'info') {
+          // A .env that is not committed is doing its job: secrets belong there.
+          // Whether it WILL be committed (untracked, no .gitignore entry) is the
+          // env-git check's finding, not this one's — reporting it twice at
+          // warning is what made people stop reading.
+          if (env && ex !== 'committed') {
+            out = { ...out, severity: 'advisory', detail: `${out.detail} Not committed — this is where the value belongs; keep the file out of git and out of client bundles.` };
+          } else if (ex === 'ignored') {
+            out = { ...out, severity: 'advisory', detail: `${out.detail} This file is gitignored, so the value cannot leak through git — keep it that way and out of client bundles.` };
+          } else if (ex === 'untracked') {
+            out = { ...out, severity: atMost(out.severity, 'warning'), detail: `${out.detail} The file is not committed yet — it is one \`git add -A\` away from being. Add it to .gitignore or move the value to an env var.` };
+          } else if (ex === 'no-git') {
+            out = { ...out, severity: atMost(out.severity, 'warning'), detail: `${out.detail} This folder is not a git repository, so nothing leaks through git; the risk is copying or zipping the folder. Move the value to an env var before this becomes a repo.` };
+          }
+        }
+        findings.push(out);
       };
 
       for (const p of PATTERNS) {
@@ -184,6 +316,7 @@ export const secretsChecker: Checker = {
           // A secret in a server env/config file is expected — the risk is
           // committing it (env-git flags that), so it is a warning, not a leak.
           const severity = env && p.severity === 'critical' ? 'warning' : p.severity;
+          const proven = HIGH_CONFIDENCE.has(p.id) && looksLikeRealMaterial(p.id, hit, content, m.index ?? 0, m[1]);
           push({
             id: p.id,
             severity,
@@ -197,11 +330,12 @@ export const secretsChecker: Checker = {
             file: rel,
             line: lineAt(content, m.index ?? 0),
             evidence: redact(hit),
-          });
+          }, proven, hit);
         }
       }
 
       // Supabase service_role key (a JWT whose payload role is service_role).
+      // The decoded role proves what it is, so it is never a docs-only info.
       for (const m of content.matchAll(JWT)) {
         const payload = decodeJwtPayload(m[0]);
         if (payload && payload['role'] === 'service_role') {
@@ -220,13 +354,18 @@ export const secretsChecker: Checker = {
             file: rel,
             line: lineAt(content, m.index ?? 0),
             evidence: redact(m[0]),
-          });
+          }, true, m[0]);
         }
       }
 
       // Quoted key/secret assignments in code, filtered by placeholder + entropy.
       for (const m of content.matchAll(GENERIC)) {
-        const value = m[1] ?? '';
+        const name = m[1] ?? '';
+        const value = m[2] ?? '';
+        if (NON_SECRET_NAME.test(name) || looksLikeBlob(value)) continue;
+        // Credentials have no whitespace ("Show password" is UI text) and carry
+        // digits or real length ("build-time-secret" is a label).
+        if (/\s/.test(value) || (!/[0-9]/.test(value) && value.length < 24)) continue;
         if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.2) continue;
         push({
           id: 'generic_secret',
@@ -239,7 +378,7 @@ export const secretsChecker: Checker = {
           file: rel,
           line: lineAt(content, m.index ?? 0),
           evidence: redact(value),
-        });
+        }, false, value);
       }
 
       // name=value / key: value assignments (env, config, Dockerfile ENV/ARG).
@@ -249,6 +388,8 @@ export const secretsChecker: Checker = {
           if (!SECRET_NAME.test(name)) continue;
           const value = (m[2] ?? '').trim().replace(/^["']|["']$/g, '').replace(/["'].*$/, '');
           if (value.length < 8 || looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
+          // "build-time-secret" is a label, not a credential: real values carry digits or length.
+          if (!/[0-9]/.test(value) && value.length < 24) continue;
           push({
             id: 'env_secret',
             severity: 'warning',
@@ -262,20 +403,24 @@ export const secretsChecker: Checker = {
             file: rel,
             line: lineAt(content, m.index ?? 0),
             evidence: redact(value),
-          });
+          }, false, value);
         }
       }
     }
 
     // De-duplicate only true repeats: the same secret, same place, same rule.
     // (Keying on file:line alone hid every extra key on a minified line.)
-    const rank: Record<Severity, number> = { critical: 0, warning: 1, info: 2, advisory: 3 };
+    const order: Record<Severity, number> = { critical: 0, warning: 1, info: 2, advisory: 3 };
     const seen = new Map<string, Finding>();
     for (const f of findings) {
       const key = `${f.file ?? ''}:${f.line ?? 0}:${f.id}:${f.evidence ?? ''}`;
       const cur = seen.get(key);
-      if (!cur || rank[f.severity] < rank[cur.severity]) seen.set(key, f);
+      if (!cur || order[f.severity] < order[cur.severity]) seen.set(key, f);
     }
-    return [...seen.values()];
+    // A vendor pattern or a decoded JWT already identifies the value on a line;
+    // the name-based env_secret / generic_secret there is the same fact twice.
+    const NAME_BASED = new Set(['env_secret', 'generic_secret']);
+    const specificAt = new Set([...seen.values()].filter((f) => !NAME_BASED.has(f.id)).map((f) => `${f.file ?? ''}:${f.line ?? 0}`));
+    return [...seen.values()].filter((f) => !(NAME_BASED.has(f.id) && specificAt.has(`${f.file ?? ''}:${f.line ?? 0}`)));
   },
 };

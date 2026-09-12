@@ -1,10 +1,10 @@
 // Lightweight regression tests for the detectors. Run with `pnpm test` after `pnpm build`.
 // Offline only — no network, no real backends.
 import assert from 'node:assert';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
+import { rmSync, chmodSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
 import { readFileSync, existsSync } from 'node:fs';
 import { scanStatic } from '../dist/engine/scan.js';
 import { collectEndpoints, concretePath } from '../dist/engine/endpoints.js';
@@ -15,27 +15,7 @@ import { checkLiveSite } from '../dist/engine/checkers/live/http-checks.js';
 import { idorDifferential } from '../dist/engine/checkers/live/idor.js';
 import { summarize, exitCodeFor, badgeMarkdown } from '../dist/engine/report.js';
 
-const CLI = new URL('../dist/cli/index.js', import.meta.url).pathname;
-const ok = (status, body = '{"id":1}', headers = {}) => ({ status, ok: status < 300, headers: new Headers(headers), body });
-const ALL_HEADERS = { 'content-security-policy': 'x', 'strict-transport-security': 'x', 'x-frame-options': 'x', 'x-content-type-options': 'x' };
-
-let passed = 0;
-const failures = [];
-function check(name, fn) {
-  try { fn(); passed++; console.log(`  ✓ ${name}`); }
-  catch (e) { failures.push(name); console.log(`  ✗ ${name}\n     ${e.message}`); }
-}
-
-function fixture(files) {
-  const dir = mkdtempSync(join(tmpdir(), 'evg-test-'));
-  for (const [rel, content] of Object.entries(files)) {
-    const full = join(dir, rel);
-    mkdirSync(join(full, '..'), { recursive: true });
-    writeFileSync(full, content, 'utf8');
-  }
-  return dir;
-}
-const ids = (r) => r.findings.map((f) => f.id);
+import { CLI, ok, ALL_HEADERS, state, check, fixture, ids, runCli, CRITICAL_FIXTURE } from './_harness.mjs';
 
 console.log('detectors');
 
@@ -60,10 +40,12 @@ await (async () => {
 await (async () => {
   const dir = fixture({ '.env': 'OPENAI_API_KEY=sk-proj-abc123DEF456ghi789JKL012mno345PQR\n' });
   const r = await scanStatic(dir);
-  check('secrets in .env are warnings, not source-leak criticals', () => {
+  // A .env that is not committed is where the value belongs: advisory, not a
+  // warning to act on. Committed / example-file cases live in tests/wp-precision.mjs.
+  check('secrets in an uncommitted .env are advisory, not source-leak criticals', () => {
     const openai = r.findings.find((f) => f.id === 'openai_key');
     assert.ok(openai, 'openai key should be found');
-    assert.strictEqual(openai.severity, 'warning');
+    assert.strictEqual(openai.severity, 'advisory');
   });
   check('env-git without git repo reports info, not a false clean', () => {
     assert.ok(ids(r).includes('env_git_unverified'));
@@ -136,8 +118,13 @@ await (async () => {
 
 await (async () => {
   const dir = fixture({ 'config.yml': 'openai: sk-proj-abc123DEF456ghi789JKL012mno345PQR\n' });
+  // Severity follows git exposure: a committed key is a leak; the same key in a
+  // folder that is not a repo is a warning (tests/wp-precision.mjs covers both).
+  spawnSync('git', ['-C', dir, 'init', '-q']);
+  spawnSync('git', ['-C', dir, 'add', 'config.yml']);
+  spawnSync('git', ['-C', dir, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'x']);
   const r = await scanStatic(dir);
-  check('secrets: vendor key in config.yml stays critical (not downgraded)', () => {
+  check('secrets: vendor key in a committed config.yml stays critical (not downgraded)', () => {
     const k = r.findings.find((f) => f.id === 'openai_key');
     assert.ok(k, 'openai key in yaml should be found');
     assert.strictEqual(k.severity, 'critical');
@@ -274,8 +261,6 @@ await (async () => {
 
 console.log('\nwizard <-> CLI are one pipeline');
 
-const CRITICAL_FIXTURE = { 'db/001.sql': 'CREATE TABLE public.users (id uuid, email text);\n' };
-const runCli = (argv, opts = {}) => spawnSync(process.execPath, [CLI, ...argv], { encoding: 'utf8', input: opts.input ?? '', cwd: opts.cwd });
 
 check('normalizeUrl: bare domain is accepted, junk is rejected', () => {
   assert.strictEqual(normalizeUrl('example.com'), 'https://example.com');
@@ -1149,6 +1134,8 @@ const LIVENESS = {
   generic_secret: { 'a.ts': `const apiSecret = "${A30}";\n` },
   env_secret: { '.env': 'PASSWORD=G7m2Q9v4R8c5N1p6Xk\n' },
   public_env_secret: { '.env': `NEXT_PUBLIC_API_TOKEN=${A30}\n` },
+  public_key_client: { '.env': `VITE_SUPABASE_KEY=sb_publishable_${A24}\n` },
+  rls_not_applicable: { 'db/1.sql': 'CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);\n' },
   cors_star: { 'a.ts': 'app.use(cors({origin: "*"}));\n' },
   debug_on: { 'a.py': 'DEBUG = True\n' },
   eval_use: { 'a.ts': 'const r = eval(userInput);\n' },
@@ -1182,5 +1169,10 @@ await (async () => {
 })();
 
 
-console.log(`\n${passed} passed, ${failures.length} failed`);
-process.exit(failures.length ? 1 : 0);
+// Per-area regression files share the tally via tests/_harness.mjs.
+for (const wp of ['wp-consent', 'wp-http', 'wp-mask', 'wp-sql', 'wp-static', 'wp-precision']) {
+  if (existsSync(new URL(`./${wp}.mjs`, import.meta.url))) await import(`./${wp}.mjs`);
+}
+
+console.log(`\n${state.passed} passed, ${state.failures.length} failed`);
+process.exit(state.failures.length ? 1 : 0);

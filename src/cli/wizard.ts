@@ -1,9 +1,8 @@
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { scanStatic, type ScanResult } from '../engine/scan.js';
-import { runFlow, type ConsentRequest } from '../orchestrator/flow.js';
-import { discoverSupabase } from '../engine/checkers/backend/supabase.js';
-import { discoverFirebase } from '../engine/checkers/backend/firebase.js';
+import { consentKey, liveTargets, planTargets, runFlow, type ConsentRequest, type Target, type TargetPlan } from '../orchestrator/flow.js';
+import { loadConfig } from '../engine/config.js';
 import { summarize } from '../engine/report.js';
 import { t, type Lang } from '../engine/i18n.js';
 import { color } from '../engine/util/color.js';
@@ -20,6 +19,8 @@ export interface WizardArgs {
   supabaseKey?: string;
   /** --i-own-this / --yes: ownership already asserted, don't ask again. */
   autoYes?: boolean;
+  /** The report directory — must not be scanned as project files. */
+  excludeAbs?: string[];
 }
 
 /**
@@ -120,7 +121,7 @@ export async function runWizard(args: WizardArgs): Promise<ScanResult> {
 
   // Step 1 — static code review (always, safe).
   w(`  ${color.bold(t(lang, 'wiz.step1'))}${color.gray(t(lang, 'wiz.step1hint'))}`);
-  const staticResult = await scanStatic(root, { configPath: args.config });
+  const staticResult = await scanStatic(root, { configPath: args.config, excludeAbs: args.excludeAbs });
   const s0 = summarize(staticResult.findings, staticResult.runs);
   w(color.gray(`  ${t(lang, 'wiz.step1result', { files: staticResult.fileCount, crit: s0.counts.critical, warn: s0.counts.warning })}`));
   w();
@@ -132,37 +133,51 @@ export async function runWizard(args: WizardArgs): Promise<ScanResult> {
   w();
 
   // Step 3 — live checks (opt-in, own project only).
+  // The targets are planned ONCE here, over the same ignorePaths-filtered file
+  // set the flow uses, and the very same plan is handed to runFlow. Consent is
+  // bound to a concrete normalized target, so the host shown in a question is
+  // exactly the host that gets probed — never a second discovery's pick.
   w(`  ${color.bold(t(lang, 'wiz.step3'))}${color.gray(t(lang, 'wiz.step3hint'))}`);
-  const sb = args.supabaseUrl && args.supabaseKey
-    ? { url: args.supabaseUrl, anonKey: args.supabaseKey, keyKind: 'jwt-anon' as const }
-    : discoverSupabase(staticResult.files);
-  const fb = discoverFirebase(staticResult.files);
-  let approveSupabase = false;
-  let approveFirebase = false;
+  const config = loadConfig(root, args.config);
+  const base = planTargets(staticResult.files, config, {
+    appUrl: args.appUrl,
+    supabaseUrl: args.supabaseUrl,
+    supabaseKey: args.supabaseKey,
+    idorTokens: args.idorTokens,
+  });
+  const approved = new Set<string>();
+  const sb = base.targets.find((x) => x.kind === 'supabase');
+  const fb = base.targets.find((x) => x.kind === 'firebase');
 
   if (sb) {
-    w(color.gray(t(lang, 'wiz.sbFound', { url: sb.url })));
+    w(color.gray(t(lang, sb.explicit ? 'wiz.sbFromFlag' : 'wiz.sbFound', { url: sb.target })));
     w(color.gray(t(lang, 'wiz.sbDesc1')));
     w(color.gray(t(lang, 'wiz.sbDesc2')));
-    approveSupabase = args.autoYes ? true : await askYesNo(t(lang, 'wiz.qSb'), false);
+    const yes = args.autoYes ? true : await askYesNo(t(lang, 'wiz.qSb'), false);
+    if (yes) approved.add(consentKey('supabase', sb.target));
+    else if (sb.explicit) w(color.yellow(t(lang, 'wiz.notRun', { target: sb.target })));
     w();
   }
   if (fb) {
-    w(color.gray(t(lang, 'wiz.fbFound', { id: fb.projectId })));
-    approveFirebase = args.autoYes ? true : await askYesNo(t(lang, 'wiz.qFb'), false);
+    w(color.gray(t(lang, 'wiz.fbFound', { id: fb.target })));
+    const yes = args.autoYes ? true : await askYesNo(t(lang, 'wiz.qFb'), false);
+    if (yes) approved.add(consentKey('firebase', fb.target));
     w();
   }
 
   // A URL from the command line wins; otherwise ask — and never silently discard
-  // a non-empty answer that merely lacks a scheme.
-  let appUrl = args.appUrl;
-  if (!appUrl) {
-    for (let attempt = 0; attempt < 2 && !appUrl; attempt++) {
+  // a non-empty answer that merely lacks a scheme. A typed URL extends the plan
+  // the same way a flag would; it is still a request the person made.
+  let live = base.targets.find((x) => x.kind === 'live');
+  const extra: Target[] = [];
+  if (!live) {
+    for (let attempt = 0; attempt < 2 && !live; attempt++) {
       const raw = await ask(t(lang, 'wiz.qUrl'));
       if (raw === null || raw === '') break; // EOF or empty = deliberately skip
       const normalized = normalizeUrl(raw);
       if (normalized) {
-        appUrl = normalized;
+        extra.push(...liveTargets(normalized, args.idorTokens, 'wizard'));
+        live = extra.find((x) => x.kind === 'live');
         if (normalized !== raw) w(color.gray(`  → ${t(lang, 'wiz.urlNormalized', { url: normalized })}`));
       } else {
         w(color.yellow(`  ${t(lang, 'wiz.urlInvalid', { input: raw })}`));
@@ -170,34 +185,32 @@ export async function runWizard(args: WizardArgs): Promise<ScanResult> {
     }
   }
   // Probing a live host always needs ownership confirmation, even from --url.
-  let approveLive = !!appUrl;
-  if (appUrl && !args.autoYes) {
-    approveLive = await askYesNo(t(lang, 'wiz.qOwn', { url: appUrl }), false);
+  // A declined request is NOT dropped: it stays in the plan so the flow records
+  // it as a requested check that did not run (visible in coverage, gate incomplete).
+  if (live) {
+    const yes = args.autoYes ? true : await askYesNo(t(lang, 'wiz.qOwn', { url: live.target }), false);
+    if (yes) {
+      approved.add(consentKey('live', live.target));
+      if (args.idorTokens) approved.add(consentKey('idor', live.target));
+    } else {
+      w(color.yellow(t(lang, 'wiz.notRun', { target: live.target })));
+    }
   }
   rl?.close();
   w();
 
-  const consent = async (req: ConsentRequest): Promise<boolean> => {
-    switch (req.kind) {
-      case 'supabase': return approveSupabase;
-      case 'firebase': return approveFirebase;
-      case 'live': return approveLive;
-      case 'idor': return approveLive && !!args.idorTokens;
-      default: return false;
-    }
-  };
+  const plan: TargetPlan = { targets: [...base.targets, ...extra] };
+  const consent = async (req: ConsentRequest): Promise<boolean> => approved.has(consentKey(req.kind, req.target));
   const log = (m: string) => process.stdout.write(color.gray(`  … ${m}\n`));
 
   w(`  ${color.bold(t(lang, 'wiz.running'))}`);
   return runFlow({
+    excludeAbs: args.excludeAbs,
     root,
     configPath: args.config,
-    appUrl: approveLive ? appUrl : undefined,
-    supabaseUrl: args.supabaseUrl,
-    supabaseKey: args.supabaseKey,
     runDeps,
-    idorTokens: args.idorTokens,
     precomputedStatic: staticResult,
+    plan,
     consent,
     log,
   });

@@ -29,7 +29,10 @@ export interface SqlToken {
   start: number;
   /** Offset just past the token's last character. */
   end: number;
-  /** dollarString only: where its body starts, for re-lexing a DO block in place. */
+  /**
+   * string / dollarString: where the contents start, for re-lexing a DO block
+   * in place. `DO 'BEGIN … END'` is as executable as `DO $$ … $$`.
+   */
   bodyStart?: number;
 }
 
@@ -98,7 +101,13 @@ export function lexSql(sql: string, offset = 0): SqlToken[] {
         j++;
       }
       const end = Math.min(j + 1, n);
-      out.push({ type: 'string', value: sql.slice(i + 1, Math.max(i + 1, j)), start: offset + i, end: offset + end });
+      out.push({
+        type: 'string',
+        value: sql.slice(i + 1, Math.max(i + 1, j)),
+        start: offset + i,
+        end: offset + end,
+        bodyStart: offset + i + 1,
+      });
       i = end; continue;
     }
 

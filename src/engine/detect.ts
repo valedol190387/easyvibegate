@@ -24,13 +24,9 @@ export function detect(root: string, files: ScanFile[]): Detection {
     else if (f.ext === '.rs') languages.add('rust');
   }
 
-  if (has('pnpm-lock.yaml')) pms.add('pnpm');
-  if (has('package-lock.json')) pms.add('npm');
-  if (has('yarn.lock')) pms.add('yarn');
-  if (has('bun.lockb') || has('bun.lock')) pms.add('bun');
-
   const pkg = files.find((f) => f.rel === 'package.json');
   let deps: Record<string, string> = {};
+  let declaredPackageManager: string | undefined;
   if (pkg) {
     try {
       const j = JSON.parse(pkg.content) as {
@@ -39,14 +35,24 @@ export function detect(root: string, files: ScanFile[]): Detection {
         packageManager?: string;
       };
       deps = { ...(j.dependencies ?? {}), ...(j.devDependencies ?? {}) };
-      // The `packageManager` field (Corepack) is authoritative when present.
       const pmField = j.packageManager?.split('@')[0];
-      if (pmField === 'pnpm' || pmField === 'yarn' || pmField === 'npm' || pmField === 'bun') pms.add(pmField);
+      if (pmField === 'pnpm' || pmField === 'yarn' || pmField === 'npm' || pmField === 'bun') declaredPackageManager = pmField;
     } catch {
       /* ignore malformed package.json */
     }
   }
   const dep = (n: string) => n in deps;
+
+  // The `packageManager` field (Corepack) is authoritative, so it goes FIRST:
+  // `packageManagers[0]` is the manager the audit runs with. Adding it after
+  // the lockfiles let a stale pnpm-lock.yaml win over `packageManager: npm@10`.
+  // Lockfiles follow in preference order (a leftover package-lock.json beside
+  // pnpm-lock.yaml is the common stale one).
+  if (declaredPackageManager) pms.add(declaredPackageManager);
+  if (has('pnpm-lock.yaml')) pms.add('pnpm');
+  if (has('yarn.lock')) pms.add('yarn');
+  if (has('bun.lockb') || has('bun.lock')) pms.add('bun');
+  if (has('package-lock.json')) pms.add('npm');
 
   if (dep('next')) frameworks.add('next');
   if (dep('react')) frameworks.add('react');
@@ -88,6 +94,7 @@ export function detect(root: string, files: ScanFile[]): Detection {
     backends: [...backends],
     languages: [...languages],
     packageManagers: [...pms],
+    declaredPackageManager,
     hasEnv: files.some((f) => f.rel === '.env' || /(^|\/)\.env(\.|$)/.test(f.rel)),
     hasGitignore: has('.gitignore'),
   };

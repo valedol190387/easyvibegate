@@ -1,5 +1,5 @@
 import type { CheckRun, Finding, ScanFile } from '../../types.js';
-import { isErr, request, sleep, unreliable } from '../../net/http.js';
+import { classifyBody, request, sleep } from '../../net/http.js';
 import { looksLikePlaceholder } from '../../util/text.js';
 
 export interface FirebaseProbeResult {
@@ -39,9 +39,41 @@ export function discoverFirebase(all: Pick<ScanFile, 'content' | 'rel'>[]): Fire
 
   if (!projectId || looksLikePlaceholder(projectId)) return null;
   // Only keep hosts that belong to the project we will name in the consent prompt.
-  if (databaseURL && !databaseURL.includes(projectId)) databaseURL = undefined;
-  if (storageBucket && !storageBucket.includes(projectId)) storageBucket = undefined;
-  return { projectId, databaseURL, storageBucket };
+  return {
+    projectId,
+    databaseURL: databaseURL ? ownDatabaseURL(databaseURL, projectId) : undefined,
+    storageBucket: storageBucket ? ownStorageBucket(storageBucket, projectId) : undefined,
+  };
+}
+
+/** The RTDB hostnames Firebase itself issues for a project — nothing else can be "its" database. */
+function isOwnRtdbHost(host: string, projectId: string): boolean {
+  const p = projectId.toLowerCase();
+  const regional = `${p}-default-rtdb.`; // <project>-default-rtdb.<region>.firebasedatabase.app
+  return host === `${p}.firebaseio.com`
+    || host === `${p}-default-rtdb.firebaseio.com`
+    || (host.startsWith(regional) && /^[a-z0-9-]+\.firebasedatabase\.app$/.test(host.slice(regional.length)))
+    || host === `${p}.firebaseapp.com`;
+}
+
+/**
+ * A `databaseURL` is the project's own only when its HOSTNAME is one Firebase
+ * issues for that project. A substring match would accept
+ * `https://unrelated.invalid/?project=<id>` and send probes to a stranger.
+ * Only the origin is kept: a path or query string is never part of a database URL.
+ */
+function ownDatabaseURL(raw: string, projectId: string): string | undefined {
+  let u: URL;
+  try { u = new URL(raw.trim()); } catch { return undefined; }
+  if (u.protocol !== 'https:' || !isOwnRtdbHost(u.hostname.toLowerCase(), projectId)) return undefined;
+  return u.origin;
+}
+
+/** A bucket is the project's own only under the two names Firebase assigns it. */
+function ownStorageBucket(raw: string, projectId: string): string | undefined {
+  const name = raw.trim().replace(/^gs:\/\//i, '').replace(/\/.*$/, '').toLowerCase();
+  const p = projectId.toLowerCase();
+  return name === `${p}.appspot.com` || name === `${p}.firebasestorage.app` ? name : undefined;
 }
 
 export interface FirebaseProbeOptions {
@@ -50,48 +82,38 @@ export interface FirebaseProbeOptions {
   log?: (msg: string) => void;
 }
 
-/** Only a parsable, non-empty JSON payload proves anonymous read access. */
-function hasJsonData(body: string): boolean {
-  try {
-    const v = JSON.parse(body) as unknown;
-    if (v === null || v === undefined) return false;
-    if (Array.isArray(v)) return v.length > 0;
-    if (typeof v === 'object') {
-      const o = v as Record<string, unknown>;
-      if ('error' in o) return false;
-      return Object.keys(o).length > 0;
-    }
-    return true;
-  } catch { return false; }
+// The payload shapes that prove an anonymous read got real objects back. The
+// body itself has already passed classifyBody (parsed JSON, not an error
+// envelope, not truncated), so these only look at the shape.
+function hasFirestoreDocs(v: unknown): boolean {
+  const o = v as { documents?: unknown } | null;
+  return Array.isArray(o?.documents) && o.documents.length > 0;
 }
-function hasFirestoreDocs(body: string): boolean {
-  try {
-    const v = JSON.parse(body) as { documents?: unknown[]; error?: unknown };
-    return !v.error && Array.isArray(v.documents) && v.documents.length > 0;
-  } catch { return false; }
-}
-function hasStorageObjects(body: string): boolean {
-  try {
-    const v = JSON.parse(body) as { items?: unknown[]; prefixes?: unknown[]; error?: unknown };
-    return !v.error && ((Array.isArray(v.items) && v.items.length > 0) || (Array.isArray(v.prefixes) && v.prefixes.length > 0));
-  } catch { return false; }
+function hasStorageObjects(v: unknown): boolean {
+  const o = v as { items?: unknown; prefixes?: unknown } | null;
+  return (Array.isArray(o?.items) && o.items.length > 0) || (Array.isArray(o?.prefixes) && o.prefixes.length > 0);
 }
 
-/** Probe Firebase RTDB, Firestore and Storage for anonymous read access. */
+/**
+ * Probe Firebase RTDB, Firestore and Storage for anonymous read access.
+ * Every response goes through classifyBody: a redirect, a truncated body, an
+ * HTML page or an error envelope in place of JSON is an unverified sub-check
+ * (run `partial`, named in the note), never "nothing readable".
+ */
 export async function probeFirebase(opts: FirebaseProbeOptions): Promise<FirebaseProbeResult> {
   const { creds } = opts;
   const rl = opts.rateLimitMs ?? 120;
   const log = opts.log ?? (() => {});
   const findings: Finding[] = [];
   let attempts = 0;
-  let errors = 0;
+  const lost: string[] = []; // "what (reason)"
 
   // 1. Realtime Database: the root .json endpoint.
   const rtdbBase = creds.databaseURL?.replace(/\/$/, '') ?? `https://${creds.projectId}-default-rtdb.firebaseio.com`;
   await sleep(rl);
-  const rtdb = await request(`${rtdbBase}/.json?shallow=true`);
-  attempts++; if (unreliable(rtdb) || (!isErr(rtdb) && rtdb.status >= 300 && rtdb.status < 400)) errors++;
-  if (!isErr(rtdb) && rtdb.status === 200 && hasJsonData(rtdb.body)) {
+  const rtdb = classifyBody(await request(`${rtdbBase}/.json?shallow=true`), 'json');
+  attempts++; if (rtdb.kind === 'unknown') lost.push(`RTDB (${rtdb.reason})`);
+  if (rtdb.kind === 'data') {
     findings.push({
       id: 'firebase_rtdb_open',
       severity: 'critical',
@@ -108,11 +130,11 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Firebas
   const readable: string[] = [];
   for (const col of COMMON_COLLECTIONS) {
     await sleep(rl);
-    const res = await request(
+    const res = classifyBody(await request(
       `https://firestore.googleapis.com/v1/projects/${creds.projectId}/databases/(default)/documents/${col}?pageSize=1`,
-    );
-    attempts++; if (unreliable(res) || (!isErr(res) && res.status >= 300 && res.status < 400)) errors++;
-    if (!isErr(res) && res.status === 200 && hasFirestoreDocs(res.body)) {
+    ), 'json');
+    attempts++; if (res.kind === 'unknown') lost.push(`firestore/${col} (${res.reason})`);
+    if (res.kind === 'data' && hasFirestoreDocs(res.json)) {
       readable.push(col);
     }
   }
@@ -132,9 +154,9 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Firebas
   // 3. Storage bucket object listing.
   const bucket = creds.storageBucket ?? `${creds.projectId}.appspot.com`;
   await sleep(rl);
-  const storage = await request(`https://firebasestorage.googleapis.com/v0/b/${bucket}/o`);
-  attempts++; if (unreliable(storage) || (!isErr(storage) && storage.status >= 300 && storage.status < 400)) errors++;
-  if (!isErr(storage) && storage.status === 200 && hasStorageObjects(storage.body)) {
+  const storage = classifyBody(await request(`https://firebasestorage.googleapis.com/v0/b/${bucket}/o`), 'json');
+  attempts++; if (storage.kind === 'unknown') lost.push(`storage/${bucket} (${storage.reason})`);
+  if (storage.kind === 'data' && hasStorageObjects(storage.json)) {
     findings.push({
       id: 'firebase_storage_open',
       severity: 'critical',
@@ -149,7 +171,10 @@ export async function probeFirebase(opts: FirebaseProbeOptions): Promise<Firebas
 
   log(`Firebase: probed RTDB, ${COMMON_COLLECTIONS.length} Firestore collections, storage bucket ${bucket}`);
 
+  const errors = lost.length;
   const status = errors === 0 ? 'completed' : errors < attempts ? 'partial' : 'failed';
-  const note = errors > 0 ? `${errors}/${attempts} requests errored` : undefined;
+  const note = errors > 0
+    ? `${errors}/${attempts} probe(s) not verified: ${lost.slice(0, 5).join(', ')}${errors > 5 ? ', …' : ''}`
+    : undefined;
   return { findings, run: { id: 'firebase-probe', level: 2, status, note } };
 }

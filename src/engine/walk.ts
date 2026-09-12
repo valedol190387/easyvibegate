@@ -1,5 +1,5 @@
 import { readdirSync, statSync, readFileSync } from 'node:fs';
-import { join, relative, extname, sep } from 'node:path';
+import { join, relative, extname, sep, resolve } from 'node:path';
 import type { ScanFile } from './types.js';
 
 const SKIP_DIRS = new Set([
@@ -10,6 +10,10 @@ const SKIP_DIRS = new Set([
   // folder names above misses a venv called anything else (tools/ytenv/...),
   // and then every key inside a vendored library is reported as the user's leak.
   'site-packages', '__pypackages__', 'bower_components', 'Pods',
+  // Cached API responses and scratch output are data, not the project's code.
+  // 559 of 569 "generic secrets" in one real project were pagination and
+  // tracking tokens inside data/cache/*.json.
+  'cache', 'caches', 'tmp', 'temp', '.tmp',
 ]);
 
 const TEXT_EXT = new Set([
@@ -42,14 +46,30 @@ export interface WalkResult {
   skippedUnreadable: number;
   /** Directories we could not list. Their whole subtree went unchecked. */
   skippedDirs: number;
+  /**
+   * Symlinks to directories or scannable files that were NOT followed. Their
+   * targets (e.g. `migrations -> ../shared/db`) went unchecked.
+   */
+  skippedSymlinks: number;
 }
 
 /** Recursively collect scannable text files under `root`, skipping noise. */
-export function walk(root: string): WalkResult {
+export interface WalkOptions {
+  /**
+   * Absolute directories to leave out — the report directory. Skipping it only
+   * by its default name left a custom `--output <project>/reports` in the next
+   * walk, so one source file turned into four scannable files.
+   */
+  excludeAbs?: string[];
+}
+
+export function walk(root: string, opts: WalkOptions = {}): WalkResult {
+  const excluded = new Set((opts.excludeAbs ?? []).map((d) => resolve(d)));
   const out: ScanFile[] = [];
   let skippedOversized = 0;
   let skippedUnreadable = 0;
   let skippedDirs = 0;
+  let skippedSymlinks = 0;
   const stack: string[] = [root];
 
   while (stack.length > 0) {
@@ -65,10 +85,23 @@ export function walk(root: string): WalkResult {
       continue;
     }
     for (const ent of entries) {
-      if (ent.isSymbolicLink()) continue;
       const full = join(dir, ent.name);
+      if (ent.isSymbolicLink()) {
+        // Never followed: a link can loop or escape the project root. But a
+        // link to a directory or a scannable file is unchecked content, and
+        // silently dropping it let a project whose `migrations` was a symlink
+        // PASS with full coverage. Count it so the walk is reported partial.
+        if (SKIP_DIRS.has(ent.name)) continue;
+        try {
+          const target = statSync(full); // follows the link
+          if (target.isDirectory() || (target.isFile() && isScannable(ent.name))) skippedSymlinks++;
+        } catch {
+          /* dangling link — nothing behind it to scan */
+        }
+        continue;
+      }
       if (ent.isDirectory()) {
-        if (!SKIP_DIRS.has(ent.name)) stack.push(full);
+        if (!SKIP_DIRS.has(ent.name) && !excluded.has(resolve(full))) stack.push(full);
         continue;
       }
       if (!ent.isFile() || !isScannable(ent.name)) continue;
@@ -96,5 +129,5 @@ export function walk(root: string): WalkResult {
       });
     }
   }
-  return { files: out, skippedOversized, skippedUnreadable, skippedDirs };
+  return { files: out, skippedOversized, skippedUnreadable, skippedDirs, skippedSymlinks };
 }

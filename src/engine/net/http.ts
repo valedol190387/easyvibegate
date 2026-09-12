@@ -128,3 +128,84 @@ export async function requestFollow(
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+/**
+ * What a response proves about the resource behind it:
+ *   data    — 2xx with real content (non-empty JSON / non-empty body)
+ *   empty   — 2xx but nothing in it ([] / {} / "" / 204)
+ *   denied  — 401/403: the server answered and refused
+ *   absent  — 404/405/410: nothing (for this method) at that URL. Whether that
+ *             is conclusive depends on whether the URL was guessed — a 404 for
+ *             a guessed id proves nothing, a 404 for a well-known API does.
+ *   unknown — cannot be interpreted: transport error, 5xx/429, a redirect,
+ *             truncated body, HTML/unparseable where JSON was expected, an
+ *             error envelope, or any other 4xx.
+ * Only data/empty/denied (and absent, where the URL was not guessed) are a
+ * finished sub-check. `unknown` is lost coverage and must surface as `partial`.
+ */
+export type BodyKind = 'data' | 'empty' | 'denied' | 'absent' | 'unknown';
+
+export interface BodyVerdict {
+  kind: BodyKind;
+  /** Short human reason, for the run note (e.g. "HTTP 404", "truncated body"). */
+  reason: string;
+  /** The parsed payload when `expect` was 'json' and the body parsed. */
+  json?: unknown;
+}
+
+export function looksLikeHtml(body: string): boolean {
+  return /<!doctype html|<html[\s>]|<head[\s>]|<body[\s>]/i.test(body.slice(0, 600));
+}
+
+/** A parsed JSON value with content. Error envelopes are handled by the caller. */
+function jsonHasContent(v: unknown): boolean {
+  if (v === null || v === undefined) return false;
+  if (Array.isArray(v)) return v.length > 0;
+  if (typeof v === 'object') return Object.keys(v as object).length > 0;
+  if (typeof v === 'string') return v.length > 0;
+  return true; // a bare number/boolean is content
+}
+
+/**
+ * The ONE place a probe response is turned into a verdict, so every live check
+ * applies the same rules (a truncated or unparseable body is never "clean").
+ * `expect: 'json'` requires a parsable JSON body; `'any'` accepts any bytes.
+ */
+export function classifyBody(res: HttpResult, expect: 'json' | 'any'): BodyVerdict {
+  if (isErr(res)) return { kind: 'unknown', reason: res.error };
+  const { status } = res;
+  if (status === 429 || status >= 500) return { kind: 'unknown', reason: `HTTP ${status}` };
+  // A redirect is never evidence of absence — the resource may sit behind the hop.
+  if (status >= 300 && status < 400) return { kind: 'unknown', reason: `HTTP ${status} redirect not followed` };
+  if (status === 401 || status === 403) return { kind: 'denied', reason: `HTTP ${status}` };
+  if (status === 404 || status === 405 || status === 410) return { kind: 'absent', reason: `HTTP ${status}` };
+  if (status < 200 || status >= 300) return { kind: 'unknown', reason: `HTTP ${status}` };
+  // Anything past the cap was not seen, so neither "no data" nor "no signature" holds.
+  if (res.truncated) return { kind: 'unknown', reason: 'body truncated at the 2 MB cap' };
+  if (status === 204) return { kind: 'empty', reason: 'HTTP 204' };
+
+  const body = res.body;
+  if (expect === 'any') {
+    return body.trim().length > 0 ? { kind: 'data', reason: `HTTP ${status}` } : { kind: 'empty', reason: 'empty body' };
+  }
+
+  const ctype = (res.headers.get('content-type') ?? '').toLowerCase();
+  if (ctype.includes('text/html') || looksLikeHtml(body)) return { kind: 'unknown', reason: 'HTML page where JSON was expected' };
+  const t = body.trim();
+  if (t.length === 0) return { kind: 'empty', reason: 'empty body' };
+  let json: unknown;
+  try {
+    json = JSON.parse(t);
+  } catch {
+    return { kind: 'unknown', reason: 'body is not JSON' };
+  }
+  // `{"error": …}` with a 2xx is the server telling us something went wrong,
+  // not an (empty) resource — it cannot be counted as checked.
+  if (json && typeof json === 'object' && !Array.isArray(json)) {
+    const o = json as Record<string, unknown>;
+    if ('error' in o || 'errors' in o) return { kind: 'unknown', reason: 'error envelope in a 2xx body', json };
+  }
+  return jsonHasContent(json)
+    ? { kind: 'data', reason: `HTTP ${status}`, json }
+    : { kind: 'empty', reason: 'empty JSON', json };
+}

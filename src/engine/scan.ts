@@ -17,11 +17,13 @@ export interface ScanResult {
 
 export interface ScanOptions {
   configPath?: string;
+  /** Absolute directories to leave out of the walk (the report directory). */
+  excludeAbs?: string[];
 }
 
 /** Run all Level 0 (static, read-only) checkers over a project directory. */
 export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<ScanResult> {
-  const { files, skippedOversized, skippedUnreadable, skippedDirs } = walk(root);
+  const { files, skippedOversized, skippedUnreadable, skippedDirs, skippedSymlinks } = walk(root, { excludeAbs: opts.excludeAbs });
   const detection = detect(root, files);
   const ctx = { root, files, detection };
 
@@ -40,12 +42,13 @@ export async function scanStatic(root: string, opts: ScanOptions = {}): Promise<
   }
 
   // Files we could not read are missing coverage, not a clean result.
-  const lost = skippedOversized + skippedUnreadable + skippedDirs;
+  const lost = skippedOversized + skippedUnreadable + skippedDirs + skippedSymlinks;
   if (lost > 0) {
     const parts: string[] = [];
     if (skippedOversized) parts.push(`${skippedOversized} file(s) over the 1 MB limit`);
     if (skippedUnreadable) parts.push(`${skippedUnreadable} unreadable file(s)`);
     if (skippedDirs) parts.push(`${skippedDirs} unreadable director(y/ies) — their whole subtree went unchecked`);
+    if (skippedSymlinks) parts.push(`${skippedSymlinks} symlink(s) skipped — their targets were not scanned`);
     runs.push({ id: 'walk', level: 0, status: 'partial', note: `not scanned: ${parts.join(', ')}` });
   }
 

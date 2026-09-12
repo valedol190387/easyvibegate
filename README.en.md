@@ -8,7 +8,7 @@
 
 Most scanners grep your code and say *"you might have leaked a key."* EasyVibeGate also goes to the running backend: for **Supabase/Firebase** it walks in with the public key and shows which tables are readable by anyone, with the exact `curl` — plus SQL to close it. It is honest about coverage: every check reports whether it actually ran, so a failed or skipped check is never shown as a green "all clear".
 
-> Status: **v0.4, early.** Best-supported stack: **Next.js + Supabase**. Code review runs on any stack; the live backend probe is read-only and Supabase/Firebase-focused. Not a penetration test.
+> Status: **v0.5, early.** Best-supported stack: **Next.js + Supabase**. Code review runs on any stack; the live backend probe is read-only and Supabase/Firebase-focused. Not a penetration test.
 
 ## How to run
 

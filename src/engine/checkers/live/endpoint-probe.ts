@@ -1,33 +1,23 @@
 import type { CheckRun, Finding } from '../../types.js';
 import type { Endpoint } from '../../endpoints.js';
 import { concretePath } from '../../endpoints.js';
-import { isErr, request, sleep, unreliable } from '../../net/http.js';
+import { classifyBody, request, sleep } from '../../net/http.js';
 
 export interface EndpointProbeResult {
   findings: Finding[];
   run: CheckRun;
 }
 
-/** Real, non-empty JSON payload — `[]`, `{}` and `{"error":...}` are not data. */
-function looksLikeData(body: string): boolean {
-  const t = body.trim();
-  if (t.length < 2 || !(t.startsWith('{') || t.startsWith('['))) return false;
-  try {
-    const v = JSON.parse(t) as unknown;
-    if (Array.isArray(v)) return v.length > 0;
-    if (v && typeof v === 'object') {
-      const o = v as Record<string, unknown>;
-      if ('error' in o || 'errors' in o) return false;
-      return Object.keys(o).length > 0;
-    }
-    return false;
-  } catch { return false; }
-}
-
 /**
- * Hit each GET-able endpoint with no authentication. A 200 with JSON data is a
+ * Hit each GET-able endpoint with no authentication. A 2xx with JSON data is a
  * candidate "no access control" hole — reported as a warning to confirm, since
  * some endpoints are legitimately public.
+ *
+ * Every response is classified (see classifyBody): only data / empty / denied
+ * count as a checked endpoint. A 404 (the inventory guessed the id or the
+ * prefix), an HTML page where JSON was expected, a redirect, a truncated or
+ * unparseable body all mean the endpoint was NOT verified — the run is
+ * `partial` and the note says which ones.
  */
 export async function probeEndpointsUnauth(
   appUrl: string,
@@ -45,14 +35,22 @@ export async function probeEndpointsUnauth(
     return { findings, run: { id: 'endpoint-probe', level: 2, status: 'skipped', note: 'no GET endpoints discovered' } };
   }
 
-  let errors = 0;
+  let verified = 0;
+  const unverified: string[] = []; // "GET /path (reason)"
   for (const e of targets) {
-    await sleep(rateLimitMs);
     const path = concretePath(e.path).replace(/^\/?/, '/');
+    // A route whose mount prefix is unknown would be probed at a wrong URL, and
+    // a 404 there says nothing about the real one.
+    if (e.unresolved) { unverified.push(`GET ${path} (${e.note ?? 'unresolved route prefix'})`); continue; }
+
+    await sleep(rateLimitMs);
     const res = await request(base + path, { headers: { accept: 'application/json' } });
-    if (isErr(res) || res.status === 429 || res.status >= 500 || (res.status >= 300 && res.status < 400)) { errors++; continue; }
-    if (res.status !== 200) continue;
-    if (!looksLikeData(res.body)) continue;
+    const verdict = classifyBody(res, 'json');
+    // `absent` is lumped with unknown on purpose: the id/prefix was guessed, so a
+    // 404 does not prove the real resource is protected.
+    if (verdict.kind === 'unknown' || verdict.kind === 'absent') { unverified.push(`GET ${path} (${verdict.reason})`); continue; }
+    verified++;
+    if (verdict.kind !== 'data') continue;
 
     findings.push({
       id: 'endpoint_no_auth',
@@ -67,9 +65,12 @@ export async function probeEndpointsUnauth(
     });
   }
 
-  const status = errors >= targets.length ? 'failed' : errors > 0 || dropped > 0 ? 'partial' : 'completed';
+  const status = verified === 0 ? 'failed' : unverified.length > 0 || dropped > 0 ? 'partial' : 'completed';
   const notes: string[] = [];
-  if (errors > 0) notes.push(`${errors}/${targets.length} endpoint requests errored`);
+  if (unverified.length > 0) {
+    const shown = unverified.slice(0, 5).join(', ');
+    notes.push(`${unverified.length}/${targets.length} endpoint(s) not verified: ${shown}${unverified.length > 5 ? ', …' : ''}`);
+  }
   if (dropped > 0) notes.push(`only ${MAX}/${candidates.length} endpoints probed (cap)`);
   const note = notes.length ? notes.join('; ') : undefined;
   return { findings, run: { id: 'endpoint-probe', level: 2, status, note } };

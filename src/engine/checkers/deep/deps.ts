@@ -2,11 +2,11 @@ import { execFile } from 'node:child_process';
 import type { CheckRun, Finding, Severity } from '../../types.js';
 
 interface AuditCounts {
-  critical?: number;
-  high?: number;
-  moderate?: number;
-  low?: number;
-  info?: number;
+  critical: number;
+  high: number;
+  moderate: number;
+  low: number;
+  info: number;
   total?: number;
 }
 
@@ -17,9 +17,13 @@ export interface DepsResult {
 
 interface RunResult {
   stdout: string;
+  /** Exit code; null when the process died from a signal (or never ran). */
   code: number | null;
   failedToSpawn: boolean;
 }
+
+type Manager = 'npm' | 'pnpm' | 'yarn' | 'bun';
+const MANAGERS = new Set<string>(['npm', 'pnpm', 'yarn', 'bun']);
 
 function run(cmd: string, args: string[], cwd: string, timeoutMs: number): Promise<RunResult> {
   return new Promise((resolve) => {
@@ -27,29 +31,64 @@ function run(cmd: string, args: string[], cwd: string, timeoutMs: number): Promi
       // audit tools exit non-zero when vulnerabilities are found; keep stdout.
       const e = err as (NodeJS.ErrnoException & { code?: number | string }) | null;
       const failedToSpawn = !!e && (e.code === 'ENOENT' || (e as { killed?: boolean }).killed === true);
-      const code = e && typeof e.code === 'number' ? e.code : e ? 1 : 0;
+      const code = e ? (typeof e.code === 'number' ? e.code : null) : 0;
       resolve({ stdout: stdout || '', code, failedToSpawn });
     });
   });
 }
 
 /**
+ * Exit codes that mean "the audit ran and found something", per tool docs:
+ * npm/pnpm exit 1 when vulnerabilities exist; yarn v1 exits with a bitmask of
+ * the severities found (1 info … 16 critical, max 31). Anything else is a tool
+ * or registry error — a fake pnpm exiting 7 with an empty report once counted
+ * as a clean `completed` run.
+ */
+function isVulnsFoundExit(pm: Manager, code: number): boolean {
+  if (pm === 'yarn') return code >= 1 && code <= 31;
+  return code === 1;
+}
+
+const SEVERITY_FIELDS = ['info', 'low', 'moderate', 'high', 'critical'] as const;
+
+/**
+ * Accept only a report whose severity counters are all present and numeric,
+ * with `total` (when present) equal to their sum. `{}` or a missing field is
+ * an unparseable report, never "0 vulnerabilities".
+ */
+function validCounts(v: unknown): AuditCounts | null {
+  if (typeof v !== 'object' || v === null) return null;
+  const o = v as Record<string, unknown>;
+  const out: Record<string, number> = {};
+  for (const k of SEVERITY_FIELDS) {
+    const n = o[k];
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 0) return null;
+    out[k] = n;
+  }
+  const sum = SEVERITY_FIELDS.reduce((a, k) => a + (out[k] ?? 0), 0);
+  if (o['total'] !== undefined) {
+    if (typeof o['total'] !== 'number' || o['total'] !== sum) return null;
+    out['total'] = o['total'];
+  }
+  return out as unknown as AuditCounts;
+}
+
+/**
  * Level 1: dependency vulnerability audit via the project's package manager.
  * Returns a status so an audit that could not run (offline, missing tool,
- * registry error) is never reported as "no vulnerabilities".
+ * registry error, garbage output) is never reported as "no vulnerabilities".
+ *
+ * `packageManagers` comes from detect(): the declared `packageManager` field
+ * first, then lockfile-detected managers in preference order — so [0] decides.
  */
 export async function auditDeps(
   root: string,
   packageManagers: string[],
   timeoutMs = 60000,
 ): Promise<DepsResult> {
-  const pm = packageManagers.includes('pnpm')
-    ? 'pnpm'
-    : packageManagers.includes('yarn')
-      ? 'yarn'
-      : packageManagers.includes('bun')
-        ? 'bun'
-        : 'npm';
+  const known = packageManagers.filter((m): m is Manager => MANAGERS.has(m));
+  const pm: Manager = known[0] ?? 'npm';
+  const others = [...new Set(known.slice(1))];
 
   if (pm === 'bun') {
     return {
@@ -58,34 +97,55 @@ export async function auditDeps(
     };
   }
 
+  // Several managers detected (a stale lockfile beside `packageManager`, or
+  // two lockfiles): the audit only covers the one we ran. Say so, visibly but
+  // not fatally — the audit itself did complete.
+  const conflict = others.length
+    ? `audited with ${pm}; ${others.join(', ')} lockfile(s)/declaration also present — remove the stale one so the audit covers what is actually installed`
+    : undefined;
+  const conflictFindings: Finding[] = conflict
+    ? [{
+        id: 'deps_manager_conflict',
+        severity: 'advisory',
+        title: 'Several package managers detected',
+        detail: `Dependency audit ran with ${pm}, but ${others.join(', ')} is also detected (lockfile or packageManager field).`,
+        fix: `Keep one package manager: delete the stale lockfile(s) or fix the \`packageManager\` field, so \`${pm} audit\` reflects the real dependency tree.`,
+        checker: 'deps',
+        level: 1,
+      }]
+    : [];
+  const withNote = (r: CheckRun): CheckRun => (conflict ? { ...r, note: r.note ? `${r.note}; ${conflict}` : conflict } : r);
+
   const failed = (note: string): DepsResult => ({
-    findings: [],
-    run: { id: 'deps', level: 1, status: 'failed', note },
+    findings: conflictFindings,
+    run: withNote({ id: 'deps', level: 1, status: 'failed', note }),
   });
 
   const res = await run(pm, ['audit', '--json'], root, timeoutMs);
   if (res.failedToSpawn) return failed(`${pm} not found or timed out`);
+  if (res.code === null) return failed(`${pm} audit was terminated by a signal`);
+  // A non-zero exit that is not the documented "vulnerabilities found" code is
+  // a tool error, whatever stdout says.
+  if (res.code !== 0 && !isVulnsFoundExit(pm, res.code)) return failed(`${pm} audit exited with code ${res.code}`);
   if (!res.stdout.trim()) return failed(`${pm} audit produced no output (offline or no lockfile?)`);
 
-  let counts: AuditCounts;
+  let counts: AuditCounts | null = null;
   let vulnMap: Record<string, { severity?: string; name?: string }> = {};
 
   if (pm === 'yarn') {
-    let summary: AuditCounts | undefined;
     for (const line of res.stdout.split('\n')) {
       const s = line.trim();
       if (!s.startsWith('{')) continue;
       try {
-        const obj = JSON.parse(s) as { type?: string; data?: { vulnerabilities?: AuditCounts } };
-        if (obj.type === 'auditSummary' && obj.data?.vulnerabilities) summary = obj.data.vulnerabilities;
+        const obj = JSON.parse(s) as { type?: string; data?: { vulnerabilities?: unknown } };
+        if (obj.type === 'auditSummary') counts = validCounts(obj.data?.vulnerabilities);
       } catch { /* skip */ }
     }
-    if (!summary) return failed('could not parse yarn audit output');
-    counts = summary;
+    if (!counts) return failed('unparseable audit output (no valid yarn auditSummary)');
   } else {
     let parsed: {
       error?: unknown;
-      metadata?: { vulnerabilities?: AuditCounts };
+      metadata?: { vulnerabilities?: unknown };
       vulnerabilities?: Record<string, { severity?: string; name?: string }>;
     };
     try {
@@ -95,24 +155,22 @@ export async function auditDeps(
       try {
         parsed = JSON.parse(line);
       } catch {
-        return failed('could not parse audit output');
+        return failed('unparseable audit output (not JSON)');
       }
     }
     // A valid JSON error envelope (e.g. registry unavailable) is NOT "clean".
-    if (parsed.error !== undefined || !parsed.metadata?.vulnerabilities) {
-      return failed('audit returned an error or an unrecognized shape');
+    if (typeof parsed !== 'object' || parsed === null || parsed.error !== undefined) {
+      return failed('audit returned an error envelope');
     }
-    counts = parsed.metadata.vulnerabilities;
+    counts = validCounts(parsed.metadata?.vulnerabilities);
+    if (!counts) return failed('unparseable audit output (metadata.vulnerabilities missing or malformed)');
     vulnMap = parsed.vulnerabilities ?? {};
   }
 
-  const critical = counts.critical ?? 0;
-  const high = counts.high ?? 0;
-  const moderate = counts.moderate ?? 0;
-  const low = counts.low ?? 0;
-  const total = counts.total ?? critical + high + moderate + low;
+  const { critical, high, moderate, low } = counts;
+  const total = counts.total ?? critical + high + moderate + low + counts.info;
 
-  const findings: Finding[] = [];
+  const findings: Finding[] = [...conflictFindings];
   if (total > 0) {
     const severity: Severity = critical + high > 0 ? 'critical' : moderate > 0 ? 'warning' : 'info';
     findings.push({
@@ -144,5 +202,5 @@ export async function auditDeps(
 
   // "completed" with zero findings means genuinely no known vulns — the status,
   // not an info finding, records that the check ran cleanly.
-  return { findings, run: { id: 'deps', level: 1, status: 'completed' } };
+  return { findings, run: withNote({ id: 'deps', level: 1, status: 'completed' }) };
 }
