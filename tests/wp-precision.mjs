@@ -1118,3 +1118,64 @@ const SECRET_VAL = 'Q7vB2mN9xK4rT8wY3pL6cD1hF5jA0eS2gU3iO9xN';
   });
   rmSync(dir, { recursive: true, force: true });
 }
+
+// RLS.external.disabled-drop (0.6.8): an external table (never created by any
+// migration this scan sees) that is DISABLEd then unconditionally DROPped
+// kept reporting rls_missing — the "confirmed gone" skip only fired when
+// `everCreated` was true, so a table this repo never created could never be
+// confirmed dropped, no matter how explicit the DROP was.
+{
+  const dir = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'CREATE TABLE public.notes(id uuid);\nALTER TABLE public.notes ENABLE ROW LEVEL SECURITY;\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\nDROP TABLE public.orders;\n',
+  });
+  const r = await scanStatic(dir);
+  check('RLS: an external table DISABLEd then unconditionally DROPped is confirmed gone, not a warning', () => {
+    assert.ok(!ids(r).includes('rls_missing'), `got ${JSON.stringify(r.findings.map((f) => f.title))}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Negative: an external table that is ONLY disabled, never dropped, must
+  // still be flagged — the fix must not go back to silencing every
+  // never-created table just because `created` starts out false for those too.
+  const dir = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'ALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n',
+  });
+  const r = await scanStatic(dir);
+  check('negative: an external table only ever disabled (never dropped) still warns', () => {
+    const f = r.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `got ${ids(r)}`);
+    assert.match(f.title, /orders/);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Negative: a CONDITIONAL drop must not confirm deletion — the guarded
+  // branch may never run, so the table must stay in doubt, not silently gone.
+  const dir = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'ALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\nDO $$ BEGIN\n  IF false THEN\n    DROP TABLE public.orders;\n  END IF;\nEND $$;\n',
+  });
+  const r = await scanStatic(dir);
+  check('negative: an external table with only a CONDITIONAL drop still warns as unconfirmed', () => {
+    const f = r.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `got ${ids(r)}`);
+    assert.match(f.title, /orders/);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Negative: the original, known-table case (CREATE, DISABLE, DROP, all
+  // unconditional and local) must stay a clean pass — unchanged by this fix.
+  const dir = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'CREATE TABLE public.orders(id uuid);\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\nDROP TABLE public.orders;\n',
+  });
+  const r = await scanStatic(dir);
+  check('negative: a known table created, disabled, then dropped stays a clean pass', () => {
+    assert.ok(!ids(r).includes('rls_missing'), `got ${JSON.stringify(r.findings.map((f) => f.title))}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}

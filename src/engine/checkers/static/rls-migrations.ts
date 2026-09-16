@@ -665,14 +665,27 @@ export const rlsMigrationsChecker: Checker = {
     // `everCreated` is never cleared, including across a RENAME: the spread
     // `{...cur, ...}` below carries it (and `keys`, `guarded`, `enabled`) to
     // whatever name the table currently answers to.
+    //
+    // `everDropped` answers a DIFFERENT question: was this key's removal ever
+    // CONFIRMED by an unconditional DROP, regardless of whether this repo is
+    // where it was created? `created` starts `false` for every key — that is
+    // ALSO the resting state of a table this scan never saw created OR
+    // dropped, only referenced by an ALTER (a true external table, whose
+    // existence cannot be confirmed either way). Without a separate flag,
+    // "never created, never dropped" and "never created HERE, but confirmed
+    // dropped BY a DROP this scan did see" were indistinguishable, and an
+    // external table's DISABLE-then-DROP kept reporting the DROPped table.
+    // Only an unconditional DROP sets it — a conditional one already keeps
+    // `created` (and now `everDropped`) untouched, so a maybe-drop still
+    // reports as unconfirmed rather than confirmed gone.
     interface State {
-      created: boolean; everCreated: boolean; enabled: boolean; file: string; line: number;
+      created: boolean; everCreated: boolean; everDropped: boolean; enabled: boolean; file: string; line: number;
       display: string; stateFile: string; stateLine: number; guarded: boolean; keys: Set<string>;
     }
     const state = new Map<string, State>();
     for (const e of events) {
       const cur = state.get(e.key) ?? {
-        created: false, everCreated: false, enabled: false, file: e.file, line: e.line,
+        created: false, everCreated: false, everDropped: false, enabled: false, file: e.file, line: e.line,
         display: e.display, stateFile: e.file, stateLine: e.line, guarded: false, keys: new Set([e.key]),
       };
       if (e.kind === 'rename') {
@@ -712,7 +725,7 @@ export const rlsMigrationsChecker: Checker = {
           break;
         case 'enable': cur.enabled = true; cur.stateFile = e.file; cur.stateLine = e.line; cur.guarded = false; break;
         case 'disable': cur.enabled = false; cur.stateFile = e.file; cur.stateLine = e.line; cur.guarded = false; break;
-        case 'drop': cur.created = false; cur.enabled = false; cur.stateFile = e.file; cur.stateLine = e.line; cur.guarded = false; break;
+        case 'drop': cur.created = false; cur.everDropped = true; cur.enabled = false; cur.stateFile = e.file; cur.stateLine = e.line; cur.guarded = false; break;
       }
       state.set(e.key, cur);
     }
@@ -731,7 +744,12 @@ export const rlsMigrationsChecker: Checker = {
     const findings: Finding[] = [];
     for (const [key, s] of state) {
       if (isTempKey(key)) continue; // temp tables are session-only: PostgREST never sees them
-      if (s.everCreated && !s.created) continue; // created here, then legitimately DROPped: known, gone, not a problem
+      // Confirmed gone: created here then legitimately DROPped (the original,
+      // well-tested case), OR never created here at all but still reached by
+      // an unconditional DROP this scan DID see — an external table whose
+      // removal this repo's migrations confirm, not merely reference. Either
+      // way there is nothing left to hold RLS state, on or off.
+      if (!s.created && s.everDropped) continue;
       // Reaching here means one of two things: `s.created` (created here and
       // still exists — the original, well-tested case), or `!s.everCreated`
       // (this key is only ever the target of ALTER/RENAME — an EXTERNAL
