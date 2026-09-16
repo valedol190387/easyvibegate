@@ -240,10 +240,320 @@ function isConfigish(rel: string): boolean {
     || /(^|\/)(Dockerfile|\.npmrc|\.netrc)$/.test(rel) || /docker-compose\.ya?ml$/.test(rel);
 }
 
-// Documentation, examples and test fixtures are where sample keys legitimately
-// live. A hit there is worth mentioning but is not a credential leak.
-// (shared: also used by detect.ts, to keep a project's own test suite for
-// backend-talking code from making the project look like it uses that backend.)
+const dirOf = (rel: string) => (rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '');
+const isExampleEnv = (rel: string) => /(^|\/)\.env[^/]*\.(example|sample|template|dist)$/i.test(rel) || /(^|\/)(example|sample)\.env$/i.test(rel);
+
+/**
+ * Values from the REAL env files, per directory. A committed .env.example
+ * that carries the same value as its sibling .env is not an example — it is
+ * the key, published. (Seen in the wild: OPENAI/ANTHROPIC keys identical
+ * in .env and a committed .env.example.)
+ */
+function collectRealEnvValues(files: { rel: string; content: string }[]): Map<string, Set<string>> {
+  const realEnvValues = new Map<string, Set<string>>();
+  for (const f of files) {
+    if (!isEnvFile(f.rel)) continue;
+    const set = realEnvValues.get(dirOf(f.rel)) ?? new Set<string>();
+    for (const m of f.content.matchAll(ASSIGN)) {
+      const v = (m[2] ?? '').trim().replace(/^["']|["']$/g, '').replace(/["'].*$/, '');
+      if (v.length >= 8) set.add(v);
+    }
+    realEnvValues.set(dirOf(f.rel), set);
+  }
+  return realEnvValues;
+}
+
+/** Records one candidate finding; `raw` is the unredacted value, only compared, never stored. */
+type Push = (f: Finding, proven?: boolean, raw?: string) => void;
+
+interface PushContext {
+  rel: string;
+  env: boolean;
+  example: boolean;
+  ex: Exposure;
+  realEnvValues: Map<string, Set<string>>;
+  findings: Finding[];
+}
+
+/**
+ * Severity = what the value is × how it can leak. The pattern says what it
+ * is; the example/docs path lowers confidence; git exposure decides how bad
+ * it is. Builds the per-file `push` used by every scan pass below, so that
+ * pipeline lives in one place instead of being reimplemented per pass.
+ */
+function makePush({ rel, env, example, ex, realEnvValues, findings }: PushContext): Push {
+  return (f, proven = false, raw) => {
+    let out: Finding = f;
+    const realValueInExample = !!raw && isExampleEnv(rel) && (realEnvValues.get(dirOf(rel))?.has(raw) ?? false);
+    if (realValueInExample) {
+      // Not an example at all: the live value copied into the example file.
+      out = {
+        ...f,
+        severity: ex === 'committed' ? 'critical' : 'warning',
+        title: `${f.title} — the REAL value from .env, in an example file${ex === 'committed' ? ' that is committed' : ''}`,
+        detail: `${f.detail} This value is identical to the one in the sibling .env: the example file carries the real credential${ex === 'committed' ? ', and it is committed to git' : ''}.`,
+        fix: 'Replace the value in the example file with a placeholder, and rotate the credential — it has been published.',
+      };
+    } else if (example && proven) {
+      out = {
+        ...f,
+        severity: f.severity === 'critical' ? 'warning' : f.severity,
+        title: `${f.title} (in docs/example path — looks real)`,
+        detail: `${f.detail} The path suggests documentation or a fixture, but the value has the structure of real key material — verify it, and rotate it if it is genuine.`,
+      };
+    } else if (example) {
+      out = {
+        ...f,
+        severity: 'info',
+        title: `${f.title} (in docs/example file)`,
+        detail: `${f.detail} This looks like documentation or a fixture — confirm it is not a real credential.`,
+      };
+    }
+    // Git exposure. A committed secret keeps its full severity. Everything
+    // else cannot leak through the repository right now: an ignored file is
+    // doing exactly what it should (advisory); an untracked file in a repo
+    // or a folder that is not a repo is hygiene, capped at warning.
+    if (!realValueInExample && out.severity !== 'info') {
+      // A .env that is not committed is doing its job: secrets belong there.
+      // Whether it WILL be committed (untracked, no .gitignore entry) is the
+      // env-git check's finding, not this one's — reporting it twice at
+      // warning is what made people stop reading.
+      if (env && ex !== 'committed') {
+        // This also covers `ex === 'ignored'`: an env file is always the
+        // right place for a secret whether or not it's ALSO gitignored, so
+        // there is nothing a separate ignored-env-file branch would add.
+        out = { ...out, severity: 'advisory', detail: `${out.detail} Not committed — this is where the value belongs; keep the file out of git and out of client bundles.` };
+      } else if (ex === 'ignored') {
+        // Gitignored, but not an env file: a credential pasted into a tool
+        // config or a script (a prod DB password inside a permission rule in
+        // .claude/settings.local.json was reported as a mere advisory). It
+        // cannot leak through git today; it still does not belong there.
+        out = { ...out, severity: atMost(out.severity, 'warning'), detail: `${out.detail} The file is gitignored, so this cannot leak through git — but it is a credential pasted into a config/source file, not an env var. Move it to .env (also gitignored) so one \`git add -A\` or a shared zip never carries it.` };
+      } else if (ex === 'untracked') {
+        out = { ...out, severity: atMost(out.severity, 'warning'), detail: `${out.detail} The file is not committed yet — it is one \`git add -A\` away from being. Add it to .gitignore or move the value to an env var.` };
+      } else if (ex === 'no-git') {
+        out = { ...out, severity: atMost(out.severity, 'warning'), detail: `${out.detail} This folder is not a git repository, so nothing leaks through git; the risk is copying or zipping the folder. Move the value to an env var before this becomes a repo.` };
+      }
+    }
+    findings.push(out);
+  };
+}
+
+/** Vendor-shaped keys (OpenAI, AWS, Stripe, a DB URL password, a PEM block, …). */
+function scanVendorPatterns(content: string, rel: string, env: boolean, push: Push): void {
+  for (const p of PATTERNS) {
+    for (const m of content.matchAll(p.re)) {
+      const hit = m[0];
+      if (looksLikePlaceholder(hit)) continue; // YOUR_KEY / EXAMPLE / xxxxx / <...>
+      if (p.validate && !p.validate(hit)) continue;
+      // A secret in a server env/config file is expected — the risk is
+      // committing it (env-git flags that), so it is a warning, not a leak.
+      const severity = env && p.severity === 'critical' ? 'warning' : p.severity;
+      const proven = HIGH_CONFIDENCE.has(p.id) && looksLikeRealMaterial(p.id, hit, content, m.index ?? 0, m[1]);
+      push({
+        id: p.id,
+        severity,
+        title: env ? `${p.title} (in env/config file)` : p.title,
+        detail: env
+          ? `${p.title} in ${rel} (${redact(hit)}). Normal for server env — keep this file gitignored and out of client bundles.`
+          : `${p.title} found in source: ${redact(hit)}`,
+        fix: env ? 'Keep this file out of git and out of client bundles; rotate the value if it may have been committed.' : p.fix,
+        checker: 'secrets',
+        level: 0,
+        file: rel,
+        line: lineAt(content, m.index ?? 0),
+        evidence: redact(hit),
+      }, proven, hit);
+    }
+  }
+}
+
+/**
+ * Supabase service_role key (a JWT whose payload role is service_role). The
+ * decoded role proves what it is, so it is never a docs-only info.
+ */
+function scanServiceRoleJwt(content: string, rel: string, env: boolean, push: Push): void {
+  for (const m of content.matchAll(JWT)) {
+    const payload = decodeJwtPayload(m[0]);
+    if (payload && payload['role'] === 'service_role') {
+      push({
+        id: 'supabase_service_role_key',
+        severity: env ? 'warning' : 'critical',
+        title: env ? 'Supabase service_role key (in env/config file)' : 'Supabase service_role key in source',
+        detail: env
+          ? `A service_role JWT is in ${rel}. Fine for server env only — never commit it or ship it to the client; keep the file gitignored.`
+          : 'A service_role JWT bypasses Row Level Security entirely and is in source/client code. It must never ship to the client or the repo.',
+        fix: env
+          ? 'Keep it server-side only, ensure the file is gitignored, and rotate it if it may have been committed.'
+          : 'Remove it, rotate the service_role key in Supabase settings, and use it only in trusted server code.',
+        checker: 'secrets',
+        level: 0,
+        file: rel,
+        line: lineAt(content, m.index ?? 0),
+        evidence: redact(m[0]),
+      }, true, m[0]);
+    }
+  }
+}
+
+/** Quoted key/secret assignments in code, filtered by placeholder + entropy. */
+function scanGenericAssignments(content: string, rel: string, push: Push): void {
+  for (const m of content.matchAll(GENERIC)) {
+    const name = m[1] ?? '';
+    const value = m[2] ?? '';
+    if (NON_SECRET_NAME.test(name) || looksLikeBlob(value)) continue;
+    // Credentials have no whitespace ("Show password" is UI text) and carry
+    // digits or real length ("build-time-secret" is a label).
+    if (/\s/.test(value) || (!/[0-9]/.test(value) && value.length < 24)) continue;
+    if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.2) continue;
+    push({
+      id: 'generic_secret',
+      severity: 'warning',
+      title: 'Possible hardcoded secret',
+      detail: `A high-entropy value is assigned to a secret-looking name: ${redact(value)}`,
+      fix: 'If this is a real credential, move it to a server-side env var and rotate it. If not, rename the variable or add `// easyvibegate-ignore`.',
+      checker: 'secrets',
+      level: 0,
+      file: rel,
+      line: lineAt(content, m.index ?? 0),
+      evidence: redact(value),
+    }, false, value);
+  }
+}
+
+/**
+ * name=value / key: value assignments (env, config, Dockerfile ENV/ARG). Runs
+ * before scanInlineEnv so a plain, single-assignment line keeps this rule's
+ * more specific title/fix on the dedup tie in dedupeFindings, rather than the
+ * inline-assignment rule's generic one.
+ */
+function scanConfigAssignments(content: string, rel: string, env: boolean, push: Push): void {
+  if (!isConfigish(rel)) return;
+  for (const m of content.matchAll(ASSIGN)) {
+    const name = m[1] ?? '';
+    if (!SECRET_NAME.test(name)) continue;
+    const value = (m[2] ?? '').trim().replace(/^["']|["']$/g, '').replace(/["'].*$/, '');
+    if (value.length < 8 || looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
+    // "build-time-secret" is a label, not a credential: real values carry digits or length.
+    if (!/[0-9]/.test(value) && value.length < 24) continue;
+    push({
+      id: 'env_secret',
+      severity: 'warning',
+      title: env ? 'Secret in env file' : 'Secret in config file',
+      detail: `"${name}" holds a high-entropy value in ${rel}: ${redact(value)}`,
+      fix: env
+        ? 'Fine for server env — keep this file gitignored and out of the client; rotate if it may have leaked.'
+        : 'Move this secret out of committed config into a server-side secret store, and rotate it.',
+      checker: 'secrets',
+      level: 0,
+      file: rel,
+      line: lineAt(content, m.index ?? 0),
+      evidence: redact(value),
+    }, false, value);
+  }
+}
+
+/**
+ * Inline shell-style assignments mid-line, in every file including
+ * config-ish ones. scanConfigAssignments is start-of-line and one-per-line,
+ * so it never sees a Compose `environment:` list item (`- TOKEN=…`), a CI
+ * step's inline `run: TOKEN=… cmd`, or a second KEY=VALUE later on the same
+ * Dockerfile ENV line — all real leaks it silently missed while this ran
+ * only for non-config files. Also still needed for the original case: a prod
+ * DB password inside a permission rule in .claude/settings.local.json,
+ * invisible to every other name-based rule.
+ */
+function scanInlineEnv(content: string, rel: string, push: Push): void {
+  for (const m of content.matchAll(INLINE_ENV)) {
+    const name = m[1] ?? '';
+    const value = m[2] ?? '';
+    if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
+    if (!/[0-9]/.test(value) && value.length < 24) continue;
+    push({
+      id: 'env_secret',
+      severity: 'warning',
+      title: 'Secret in an inline assignment',
+      detail: `"${name}" is assigned a high-entropy value inline in ${rel}: ${redact(value)}`,
+      fix: 'Move the value to a gitignored .env and reference it by name; rotate it if the file was ever shared.',
+      checker: 'secrets',
+      level: 0,
+      file: rel,
+      line: lineAt(content, m.index ?? 0),
+      evidence: redact(value),
+    }, false, value);
+  }
+}
+
+/**
+ * De-duplicate only true repeats: the same secret, same place, same rule.
+ * (Keying on file:line alone hid every extra key on a minified line.)
+ */
+function dedupeFindings(findings: Finding[]): Finding[] {
+  const seen = new Map<string, Finding>();
+  for (const f of findings) {
+    const key = `${f.file ?? ''}:${f.line ?? 0}:${f.id}:${f.evidence ?? ''}`;
+    const cur = seen.get(key);
+    if (!cur || SEVERITY_RANK[f.severity] < SEVERITY_RANK[cur.severity]) seen.set(key, f);
+  }
+  return [...seen.values()];
+}
+
+const NAME_BASED = new Set(['env_secret', 'generic_secret']);
+
+/**
+ * A vendor pattern or a decoded JWT already identifies a VALUE on a line; the
+ * name-based env_secret / generic_secret finding for that SAME value is the
+ * same fact twice. Keyed on file:line:evidence, not just file:line — two
+ * different secrets assigned on one line (`const key="sk-proj-…",
+ * password="…"`) are two different facts, and dropping the second because
+ * the first has a specific pattern hid it entirely.
+ */
+function dropRedundantNameBased(findings: Finding[]): Finding[] {
+  const specificAt = new Set(findings.filter((f) => !NAME_BASED.has(f.id)).map((f) => `${f.file ?? ''}:${f.line ?? 0}:${f.evidence ?? ''}`));
+  return findings.filter((f) => !(NAME_BASED.has(f.id) && specificAt.has(`${f.file ?? ''}:${f.line ?? 0}:${f.evidence ?? ''}`)));
+}
+
+/**
+ * Eleven advisories saying "secret in gitignored .env.local — fine" are one
+ * observation printed eleven times. Fold them into one line per file that
+ * names the variables; anything above advisory stays line by line.
+ *
+ * The final `applyIgnores` pass (scan.ts) only sees whatever this checker
+ * returns — once N findings become one summary Finding with a single `line`,
+ * a `// easyvibegate-ignore` comment placed above any secret but the first in
+ * the group can no longer reach it. Filter each candidate through the SAME
+ * inline-marker check first (an empty config so only the marker, not
+ * project-wide `ignore`/`ignorePaths` rules, applies here — those still run
+ * again, correctly, against whatever this returns), so an individually
+ * silenced secret is dropped before folding, not after.
+ */
+function foldEnvAdvisories(kept: Finding[], allFiles: Parameters<typeof partitionIgnores>[2]): Finding[] {
+  const byFile = new Map<string, Finding[]>();
+  for (const f of kept) {
+    if (f.id !== 'env_secret' || f.severity !== 'advisory' || !isEnvFile(f.file ?? '')) continue;
+    byFile.set(f.file ?? '', [...(byFile.get(f.file ?? '') ?? []), f]);
+  }
+  const folded = new Set<Finding>();
+  const summaries: Finding[] = [];
+  for (const [file, allCandidates] of byFile) {
+    const group = partitionIgnores(allCandidates, EMPTY_CONFIG, allFiles).kept;
+    // A member the marker silenced must not reappear individually either —
+    // it is done with, not merely "too few left to fold".
+    for (const f of allCandidates) if (!group.includes(f)) folded.add(f);
+    if (group.length < 2) continue;
+    for (const f of group) folded.add(f);
+    const names = group.map((f) => /^"([^"]+)"/.exec(f.detail)?.[1] ?? '?');
+    const first = group.reduce((a, b) => ((a.line ?? 0) <= (b.line ?? 0) ? a : b));
+    summaries.push({
+      ...first,
+      title: `${group.length} secrets in ${file} (not committed — where they belong)`,
+      detail: `${file} holds ${group.length} secret-looking values (${names.join(', ')}). The file is not committed, so nothing leaks through git; keep it that way and out of client bundles.`,
+      fix: 'Nothing to change here. Keep the file gitignored; rotate any value that may ever have been committed or shared.',
+      evidence: undefined,
+    });
+  }
+  return [...kept.filter((f) => !folded.has(f)), ...summaries];
+}
 
 export const secretsChecker: Checker = {
   id: 'secrets',
@@ -252,24 +562,7 @@ export const secretsChecker: Checker = {
   run(ctx) {
     const findings: Finding[] = [];
     const exposure = createExposure(ctx.root);
-
-    // Values from the REAL env files, per directory. A committed .env.example
-    // that carries the same value as its sibling .env is not an example — it is
-    // the key, published. (Seen in the wild: OPENAI/ANTHROPIC keys identical
-    // in .env and a committed .env.example.)
-    const realEnvValues = new Map<string, Set<string>>();
-    for (const f of ctx.files) {
-      if (!isEnvFile(f.rel)) continue;
-      const dir = f.rel.includes('/') ? f.rel.slice(0, f.rel.lastIndexOf('/')) : '';
-      const set = realEnvValues.get(dir) ?? new Set<string>();
-      for (const m of f.content.matchAll(ASSIGN)) {
-        const v = (m[2] ?? '').trim().replace(/^["']|["']$/g, '').replace(/["'].*$/, '');
-        if (v.length >= 8) set.add(v);
-      }
-      realEnvValues.set(dir, set);
-    }
-    const dirOf = (rel: string) => (rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '');
-    const isExampleEnv = (rel: string) => /(^|\/)\.env[^/]*\.(example|sample|template|dist)$/i.test(rel) || /(^|\/)(example|sample)\.env$/i.test(rel);
+    const realEnvValues = collectRealEnvValues(ctx.files);
 
     for (const file of ctx.files) {
       const { rel } = file;
@@ -277,256 +570,16 @@ export const secretsChecker: Checker = {
       const env = isEnvFile(rel);
       const example = looksLikeTestOrDocPath(rel);
       const ex: Exposure = exposure(rel);
+      const push = makePush({ rel, env, example, ex, realEnvValues, findings });
 
-      // `proven` = the hit is structurally real key material (see
-      // looksLikeRealMaterial). A docs/fixture path may only downgrade a
-      // heuristic or sample-looking hit to info; proven material stays at
-      // warning there — the path lowers confidence, it does not make it safe.
-
-      /**
-       * Severity = what the value is × how it can leak. The pattern says what it
-       * is; the example/docs path lowers confidence; git exposure decides how
-       * bad it is. `raw` is the unredacted value, only compared, never stored.
-       */
-      const push = (f: Finding, proven = false, raw?: string) => {
-        let out: Finding = f;
-        const realValueInExample = !!raw && isExampleEnv(rel) && (realEnvValues.get(dirOf(rel))?.has(raw) ?? false);
-        if (realValueInExample) {
-          // Not an example at all: the live value copied into the example file.
-          out = {
-            ...f,
-            severity: ex === 'committed' ? 'critical' : 'warning',
-            title: `${f.title} — the REAL value from .env, in an example file${ex === 'committed' ? ' that is committed' : ''}`,
-            detail: `${f.detail} This value is identical to the one in the sibling .env: the example file carries the real credential${ex === 'committed' ? ', and it is committed to git' : ''}.`,
-            fix: 'Replace the value in the example file with a placeholder, and rotate the credential — it has been published.',
-          };
-        } else if (example && proven) {
-          out = {
-            ...f,
-            severity: f.severity === 'critical' ? 'warning' : f.severity,
-            title: `${f.title} (in docs/example path — looks real)`,
-            detail: `${f.detail} The path suggests documentation or a fixture, but the value has the structure of real key material — verify it, and rotate it if it is genuine.`,
-          };
-        } else if (example) {
-          out = {
-            ...f,
-            severity: 'info',
-            title: `${f.title} (in docs/example file)`,
-            detail: `${f.detail} This looks like documentation or a fixture — confirm it is not a real credential.`,
-          };
-        }
-        // Git exposure. A committed secret keeps its full severity. Everything
-        // else cannot leak through the repository right now: an ignored file is
-        // doing exactly what it should (advisory); an untracked file in a repo
-        // or a folder that is not a repo is hygiene, capped at warning.
-        if (!realValueInExample && out.severity !== 'info') {
-          // A .env that is not committed is doing its job: secrets belong there.
-          // Whether it WILL be committed (untracked, no .gitignore entry) is the
-          // env-git check's finding, not this one's — reporting it twice at
-          // warning is what made people stop reading.
-          if (env && ex !== 'committed') {
-            // This also covers `ex === 'ignored'`: an env file is always the
-            // right place for a secret whether or not it's ALSO gitignored, so
-            // there is nothing a separate ignored-env-file branch would add.
-            out = { ...out, severity: 'advisory', detail: `${out.detail} Not committed — this is where the value belongs; keep the file out of git and out of client bundles.` };
-          } else if (ex === 'ignored') {
-            // Gitignored, but not an env file: a credential pasted into a tool
-            // config or a script (a prod DB password inside a permission rule in
-            // .claude/settings.local.json was reported as a mere advisory). It
-            // cannot leak through git today; it still does not belong there.
-            out = { ...out, severity: atMost(out.severity, 'warning'), detail: `${out.detail} The file is gitignored, so this cannot leak through git — but it is a credential pasted into a config/source file, not an env var. Move it to .env (also gitignored) so one \`git add -A\` or a shared zip never carries it.` };
-          } else if (ex === 'untracked') {
-            out = { ...out, severity: atMost(out.severity, 'warning'), detail: `${out.detail} The file is not committed yet — it is one \`git add -A\` away from being. Add it to .gitignore or move the value to an env var.` };
-          } else if (ex === 'no-git') {
-            out = { ...out, severity: atMost(out.severity, 'warning'), detail: `${out.detail} This folder is not a git repository, so nothing leaks through git; the risk is copying or zipping the folder. Move the value to an env var before this becomes a repo.` };
-          }
-        }
-        findings.push(out);
-      };
-
-      for (const p of PATTERNS) {
-        for (const m of content.matchAll(p.re)) {
-          const hit = m[0];
-          if (looksLikePlaceholder(hit)) continue; // YOUR_KEY / EXAMPLE / xxxxx / <...>
-          if (p.validate && !p.validate(hit)) continue;
-          // A secret in a server env/config file is expected — the risk is
-          // committing it (env-git flags that), so it is a warning, not a leak.
-          const severity = env && p.severity === 'critical' ? 'warning' : p.severity;
-          const proven = HIGH_CONFIDENCE.has(p.id) && looksLikeRealMaterial(p.id, hit, content, m.index ?? 0, m[1]);
-          push({
-            id: p.id,
-            severity,
-            title: env ? `${p.title} (in env/config file)` : p.title,
-            detail: env
-              ? `${p.title} in ${rel} (${redact(hit)}). Normal for server env — keep this file gitignored and out of client bundles.`
-              : `${p.title} found in source: ${redact(hit)}`,
-            fix: env ? 'Keep this file out of git and out of client bundles; rotate the value if it may have been committed.' : p.fix,
-            checker: 'secrets',
-            level: 0,
-            file: rel,
-            line: lineAt(content, m.index ?? 0),
-            evidence: redact(hit),
-          }, proven, hit);
-        }
-      }
-
-      // Supabase service_role key (a JWT whose payload role is service_role).
-      // The decoded role proves what it is, so it is never a docs-only info.
-      for (const m of content.matchAll(JWT)) {
-        const payload = decodeJwtPayload(m[0]);
-        if (payload && payload['role'] === 'service_role') {
-          push({
-            id: 'supabase_service_role_key',
-            severity: env ? 'warning' : 'critical',
-            title: env ? 'Supabase service_role key (in env/config file)' : 'Supabase service_role key in source',
-            detail: env
-              ? `A service_role JWT is in ${rel}. Fine for server env only — never commit it or ship it to the client; keep the file gitignored.`
-              : 'A service_role JWT bypasses Row Level Security entirely and is in source/client code. It must never ship to the client or the repo.',
-            fix: env
-              ? 'Keep it server-side only, ensure the file is gitignored, and rotate it if it may have been committed.'
-              : 'Remove it, rotate the service_role key in Supabase settings, and use it only in trusted server code.',
-            checker: 'secrets',
-            level: 0,
-            file: rel,
-            line: lineAt(content, m.index ?? 0),
-            evidence: redact(m[0]),
-          }, true, m[0]);
-        }
-      }
-
-      // Quoted key/secret assignments in code, filtered by placeholder + entropy.
-      for (const m of content.matchAll(GENERIC)) {
-        const name = m[1] ?? '';
-        const value = m[2] ?? '';
-        if (NON_SECRET_NAME.test(name) || looksLikeBlob(value)) continue;
-        // Credentials have no whitespace ("Show password" is UI text) and carry
-        // digits or real length ("build-time-secret" is a label).
-        if (/\s/.test(value) || (!/[0-9]/.test(value) && value.length < 24)) continue;
-        if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.2) continue;
-        push({
-          id: 'generic_secret',
-          severity: 'warning',
-          title: 'Possible hardcoded secret',
-          detail: `A high-entropy value is assigned to a secret-looking name: ${redact(value)}`,
-          fix: 'If this is a real credential, move it to a server-side env var and rotate it. If not, rename the variable or add `// easyvibegate-ignore`.',
-          checker: 'secrets',
-          level: 0,
-          file: rel,
-          line: lineAt(content, m.index ?? 0),
-          evidence: redact(value),
-        }, false, value);
-      }
-
-      // name=value / key: value assignments (env, config, Dockerfile ENV/ARG).
-      // Runs first so a plain, single-assignment line keeps this rule's more
-      // specific title/fix on the dedup tie below, rather than INLINE_ENV's.
-      if (isConfigish(rel)) {
-        for (const m of content.matchAll(ASSIGN)) {
-          const name = m[1] ?? '';
-          if (!SECRET_NAME.test(name)) continue;
-          const value = (m[2] ?? '').trim().replace(/^["']|["']$/g, '').replace(/["'].*$/, '');
-          if (value.length < 8 || looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
-          // "build-time-secret" is a label, not a credential: real values carry digits or length.
-          if (!/[0-9]/.test(value) && value.length < 24) continue;
-          push({
-            id: 'env_secret',
-            severity: 'warning',
-            title: env ? 'Secret in env file' : 'Secret in config file',
-            detail: `"${name}" holds a high-entropy value in ${rel}: ${redact(value)}`,
-            fix: env
-              ? 'Fine for server env — keep this file gitignored and out of the client; rotate if it may have leaked.'
-              : 'Move this secret out of committed config into a server-side secret store, and rotate it.',
-            checker: 'secrets',
-            level: 0,
-            file: rel,
-            line: lineAt(content, m.index ?? 0),
-            evidence: redact(value),
-          }, false, value);
-        }
-      }
-
-      // Inline shell-style assignments mid-line, in every file including
-      // config-ish ones. ASSIGN above is start-of-line and one-per-line, so it
-      // never sees a Compose `environment:` list item (`- TOKEN=…`), a CI
-      // step's inline `run: TOKEN=… cmd`, or a second KEY=VALUE later on the
-      // same Dockerfile ENV line — all real leaks it silently missed while
-      // this ran only for non-config files. Also still needed for the
-      // original case: a prod DB password inside a permission rule in
-      // .claude/settings.local.json, invisible to every other name-based rule.
-      for (const m of content.matchAll(INLINE_ENV)) {
-        const name = m[1] ?? '';
-        const value = m[2] ?? '';
-        if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
-        if (!/[0-9]/.test(value) && value.length < 24) continue;
-        push({
-          id: 'env_secret',
-          severity: 'warning',
-          title: 'Secret in an inline assignment',
-          detail: `"${name}" is assigned a high-entropy value inline in ${rel}: ${redact(value)}`,
-          fix: 'Move the value to a gitignored .env and reference it by name; rotate it if the file was ever shared.',
-          checker: 'secrets',
-          level: 0,
-          file: rel,
-          line: lineAt(content, m.index ?? 0),
-          evidence: redact(value),
-        }, false, value);
-      }
+      scanVendorPatterns(content, rel, env, push);
+      scanServiceRoleJwt(content, rel, env, push);
+      scanGenericAssignments(content, rel, push);
+      scanConfigAssignments(content, rel, env, push);
+      scanInlineEnv(content, rel, push);
     }
 
-    // De-duplicate only true repeats: the same secret, same place, same rule.
-    // (Keying on file:line alone hid every extra key on a minified line.)
-    const seen = new Map<string, Finding>();
-    for (const f of findings) {
-      const key = `${f.file ?? ''}:${f.line ?? 0}:${f.id}:${f.evidence ?? ''}`;
-      const cur = seen.get(key);
-      if (!cur || SEVERITY_RANK[f.severity] < SEVERITY_RANK[cur.severity]) seen.set(key, f);
-    }
-    // A vendor pattern or a decoded JWT already identifies a VALUE on a line;
-    // the name-based env_secret / generic_secret finding for that SAME value
-    // is the same fact twice. Keyed on file:line:evidence, not just
-    // file:line — two different secrets assigned on one line (`const
-    // key="sk-proj-…", password="…"`) are two different facts, and dropping
-    // the second because the first has a specific pattern hid it entirely.
-    const NAME_BASED = new Set(['env_secret', 'generic_secret']);
-    const specificAt = new Set([...seen.values()].filter((f) => !NAME_BASED.has(f.id)).map((f) => `${f.file ?? ''}:${f.line ?? 0}:${f.evidence ?? ''}`));
-    const kept = [...seen.values()].filter((f) => !(NAME_BASED.has(f.id) && specificAt.has(`${f.file ?? ''}:${f.line ?? 0}:${f.evidence ?? ''}`)));
-
-    // Eleven advisories saying "secret in gitignored .env.local — fine" are one
-    // observation printed eleven times. Fold them into one line per file that
-    // names the variables; anything above advisory stays line by line.
-    //
-    // The final `applyIgnores` pass (scan.ts) only sees whatever this checker
-    // returns — once N findings become one summary Finding with a single
-    // `line`, a `// easyvibegate-ignore` comment placed above any secret but
-    // the first in the group can no longer reach it. Filter each candidate
-    // through the SAME inline-marker check first (an empty config so only the
-    // marker, not project-wide `ignore`/`ignorePaths` rules, applies here —
-    // those still run again, correctly, against whatever this returns), so an
-    // individually silenced secret is dropped before folding, not after.
-    const byFile = new Map<string, Finding[]>();
-    for (const f of kept) {
-      if (f.id !== 'env_secret' || f.severity !== 'advisory' || !isEnvFile(f.file ?? '')) continue;
-      byFile.set(f.file ?? '', [...(byFile.get(f.file ?? '') ?? []), f]);
-    }
-    const folded = new Set<Finding>();
-    const summaries: Finding[] = [];
-    for (const [file, allCandidates] of byFile) {
-      const group = partitionIgnores(allCandidates, EMPTY_CONFIG, ctx.files).kept;
-      // A member the marker silenced must not reappear individually either —
-      // it is done with, not merely "too few left to fold".
-      for (const f of allCandidates) if (!group.includes(f)) folded.add(f);
-      if (group.length < 2) continue;
-      for (const f of group) folded.add(f);
-      const names = group.map((f) => /^"([^"]+)"/.exec(f.detail)?.[1] ?? '?');
-      const first = group.reduce((a, b) => ((a.line ?? 0) <= (b.line ?? 0) ? a : b));
-      summaries.push({
-        ...first,
-        title: `${group.length} secrets in ${file} (not committed — where they belong)`,
-        detail: `${file} holds ${group.length} secret-looking values (${names.join(', ')}). The file is not committed, so nothing leaks through git; keep it that way and out of client bundles.`,
-        fix: 'Nothing to change here. Keep the file gitignored; rotate any value that may ever have been committed or shared.',
-        evidence: undefined,
-      });
-    }
-    return [...kept.filter((f) => !folded.has(f)), ...summaries];
+    const kept = dropRedundantNameBased(dedupeFindings(findings));
+    return foldEnvAdvisories(kept, ctx.files);
   },
 };
