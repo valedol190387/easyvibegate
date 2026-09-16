@@ -1,6 +1,10 @@
 import type { CheckRun, Finding, ScanFile } from '../../types.js';
 import { classifyBody, request, sleep } from '../../net/http.js';
-import { looksLikePlaceholder } from '../../util/text.js';
+import { DNS_LABEL, looksLikePlaceholder } from '../../util/text.js';
+
+const FIREBASEIO_URL = new RegExp(`https://${DNS_LABEL}(?:-default-rtdb)?\\.firebaseio\\.com`);
+const FIREBASEAPP_DOMAIN = new RegExp(`(${DNS_LABEL})\\.firebaseapp\\.com`);
+const FIREBASEDATABASE_APP = new RegExp(`^${DNS_LABEL}\\.firebasedatabase\\.app$`);
 
 export interface FirebaseProbeResult {
   findings: Finding[];
@@ -26,13 +30,16 @@ export function discoverFirebase(all: Pick<ScanFile, 'content' | 'rel'>[]): Fire
   let databaseURL: string | undefined;
   let storageBucket: string | undefined;
 
+  // This loop runs against every project file's raw content, including large
+  // ones — see `DNS_LABEL` in util/text.ts for why the two host regexes below
+  // are bounded instead of `[a-z0-9-]+`.
   for (const f of files) {
     projectId ??= f.content.match(/projectId\s*:\s*["']([^"']+)["']/)?.[1];
     databaseURL ??= f.content.match(/databaseURL\s*:\s*["']([^"']+)["']/)?.[1]
-      ?? f.content.match(/https:\/\/[a-z0-9-]+(?:-default-rtdb)?\.firebaseio\.com/)?.[0];
+      ?? f.content.match(FIREBASEIO_URL)?.[0];
     storageBucket ??= f.content.match(/storageBucket\s*:\s*["']([^"']+)["']/)?.[1];
     if (!projectId) {
-      const dom = f.content.match(/([a-z0-9-]+)\.firebaseapp\.com/)?.[1];
+      const dom = f.content.match(FIREBASEAPP_DOMAIN)?.[1];
       if (dom) projectId = dom;
     }
   }
@@ -52,7 +59,11 @@ function isOwnRtdbHost(host: string, projectId: string): boolean {
   const regional = `${p}-default-rtdb.`; // <project>-default-rtdb.<region>.firebasedatabase.app
   return host === `${p}.firebaseio.com`
     || host === `${p}-default-rtdb.firebaseio.com`
-    || (host.startsWith(regional) && /^[a-z0-9-]+\.firebasedatabase\.app$/.test(host.slice(regional.length)))
+    // `host` here is already `new URL(...).hostname` (bounded by the caller,
+    // ownDatabaseURL below), not raw file content — but it's bounded via the
+    // shared constant anyway rather than `+`, so this stays safe even if that
+    // ever changes and nothing here looks unlike its two siblings above.
+    || (host.startsWith(regional) && FIREBASEDATABASE_APP.test(host.slice(regional.length)))
     || host === `${p}.firebaseapp.com`;
 }
 

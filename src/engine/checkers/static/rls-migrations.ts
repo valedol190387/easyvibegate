@@ -552,7 +552,28 @@ export const rlsMigrationsChecker: Checker = {
   level: 0,
   run(ctx) {
     const sqlFiles = ctx.files.filter((f) => f.ext === '.sql').sort((a, b) => a.rel.localeCompare(b.rel));
-    if (sqlFiles.length === 0) return [];
+    if (sqlFiles.length === 0) {
+      // A project that clearly talks to Supabase but ships no .sql migrations
+      // (schema managed from the dashboard, or migrations live in another repo)
+      // used to just say nothing — a silent, undeserved clean score on the exact
+      // check the tool exists for. Say what could not be checked instead.
+      const looksSupabase =
+        ctx.detection.backends.includes('supabase') ||
+        ctx.files.some(
+          (f) => !/\.(md|mdx|txt|rst)$/i.test(f.rel) &&
+            /(SUPABASE_(?:ANON|PUBLISHABLE)_KEY|sb_publishable_|\/rest\/v1\b|postgrest)/i.test(f.content),
+        );
+      if (!looksSupabase) return [];
+      return [{
+        id: 'rls_unverifiable_no_migrations',
+        severity: 'info',
+        title: 'No SQL migrations found — RLS could not be checked statically',
+        detail: 'This project talks to Supabase, but no .sql migration files exist in this repository (the schema may be managed from the dashboard, or migrations live in a different repo). A static scan can only see table/RLS state from files it can read, so no table here could be verified this way — this is missing information, not a clean result.',
+        fix: 'Run the live probe (consent + --i-own-this) to enumerate which tables the anon key can read, or check pg_class.relrowsecurity and pg_policies directly in the Supabase SQL editor.',
+        checker: 'rls-migrations',
+        level: 0,
+      }];
+    }
 
     // RLS is a PostgreSQL feature. The engine is decided per FILE, not per
     // project: a monorepo can hold a Postgres schema next to a Cloudflare D1
@@ -560,12 +581,20 @@ export const rlsMigrationsChecker: Checker = {
     // engine has no such thing. A real D1 project once got five "critical" RLS
     // findings and a 0/100 because the old gate only knew MySQL's
     // `auto_increment` (with the underscore) and never heard of D1/wrangler.
-    const pkg = ctx.files.find((f) => f.rel === 'package.json')?.content ?? '';
-    const reqs = ctx.files.find((f) => f.rel === 'requirements.txt')?.content ?? '';
-    const codeAndEnv = ctx.files
-      .filter((f) => !/\.(md|mdx|txt|rst|sql)$/i.test(f.rel))
-      .map((f) => f.content)
-      .join('\n');
+    // A monorepo's dependencies often live in apps/*/package.json, not the
+    // workspace root. Reading only the root file missed a D1/SQLite worker's
+    // `wrangler`/`better-sqlite3` signal whenever the SQL itself carried no
+    // dialect marker either, and defaulted it to Postgres — a phantom critical
+    // on a database that has no RLS to enable.
+    const pkg = ctx.files.filter((f) => f.rel.endsWith('package.json')).map((f) => f.content).join('\n');
+    const reqs = ctx.files.filter((f) => f.rel === 'requirements.txt' || f.rel.endsWith('/requirements.txt')).map((f) => f.content).join('\n');
+    // Checked with .some() against the files themselves, not a pre-joined
+    // string: joining nearly the whole project's non-doc/non-SQL content into
+    // one string on every scan doubled peak memory for the full scanned corpus
+    // to answer what is, per project, a handful of existence checks that can
+    // each stop at the first matching file.
+    const codeFiles = ctx.files.filter((f) => !/\.(md|mdx|txt|rst|sql)$/i.test(f.rel));
+    const matchesAnyCodeFile = (re: RegExp): boolean => codeFiles.some((f) => re.test(f.content));
     const pgProject =
       ctx.detection.backends.includes('supabase') ||
       /\b(pg|postgres|postgresql|@supabase\/|postgres\.js|node-postgres|pg-promise)\b/i.test(pkg) ||
@@ -574,7 +603,7 @@ export const rlsMigrationsChecker: Checker = {
     const sqliteProject =
       hasD1 ||
       /"(better-sqlite3|sqlite3|@libsql\/client)"/i.test(pkg) ||
-      /from\s+['"](bun:sqlite|drizzle-orm\/(d1|better-sqlite3|libsql))['"]/.test(codeAndEnv);
+      matchesAnyCodeFile(/from\s+['"](bun:sqlite|drizzle-orm\/(d1|better-sqlite3|libsql))['"]/);
     const mysqlProject = /"(mysql2?|mariadb)"/i.test(pkg);
     const sqliteLabel = hasD1 ? 'Cloudflare D1 (SQLite)' : 'SQLite';
 
@@ -622,7 +651,7 @@ export const rlsMigrationsChecker: Checker = {
     const exposed =
       ctx.detection.backends.includes('supabase') ||
       /@supabase\//i.test(pkg) ||
-      /(\/rest\/v1\b|postgrest|hasura|SUPABASE_(?:ANON|PUBLISHABLE)_KEY|sb_publishable_)/i.test(codeAndEnv);
+      matchesAnyCodeFile(/(\/rest\/v1\b|postgrest|hasura|SUPABASE_(?:ANON|PUBLISHABLE)_KEY|sb_publishable_)/i);
     const serverOnly =
       !exposed &&
       (/"(pg|postgres|pg-promise|@prisma\/client|drizzle-orm|knex|kysely|typeorm|sequelize)"/i.test(pkg) ||
@@ -723,12 +752,12 @@ export const rlsMigrationsChecker: Checker = {
         detail:
           kind === 'missing'
             ? (missingSeverity === 'critical'
-              ? `"${s.display}" is created in a migration and its latest state does not enable Row Level Security. If this table holds user data on Supabase, the anon key can read every row.`
+              ? `"${s.display}" is created in a migration and its latest state does not enable Row Level Security. On Supabase the anon role has full table privileges by default, so with RLS off the public key can READ, INSERT, UPDATE and DELETE every row through the REST API. Static view only: this covers tables created by migrations in this repository — tables created from the dashboard or elsewhere are not listed here; the live probe enumerates all of them.`
               : `"${s.display}" is created without Row Level Security. Only server code (pg/Prisma/…) appears to talk to this database, so nothing hands its rows to clients directly — that is normal, not a hole. It becomes CRITICAL the moment a client-facing data API (Supabase/PostgREST anon key, Hasura) is put in front of the same database.`)
             : kind === 'order'
               ? `"${s.display}" has statements in directories other than "${s.stateFile}" that contradict its final RLS state. Files in separate directories have no reliable apply order, so this cannot be decided statically — check the deployed state.`
               : `"${s.display}" has a table or RLS statement whose execution cannot be confirmed statically: inside an IF/LOOP branch or a block with an EXCEPTION handler, after a RETURN, in a rolled-back or unterminated transaction, or on a name a TEMP table may shadow. Whether it took effect cannot be decided without running the migration, so its RLS state is NOT confirmed — check the deployed state.`,
-        fix: `ALTER TABLE ${s.display} ENABLE ROW LEVEL SECURITY; then add an owner/tenant policy, and drop any permissive "USING (true)" policy (policies are OR-ed). This is a static hint — confirm the deployed state.`,
+        fix: `ALTER TABLE ${s.display} ENABLE ROW LEVEL SECURITY; then add an owner/tenant policy, and drop any permissive "USING (true)" policy (policies are OR-ed). Until policies exist, stop the bleeding without breaking reads: REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${s.display} FROM anon; This is a static hint — confirm the deployed state.`,
         checker: 'rls-migrations',
         level: 0,
         file: s.file,

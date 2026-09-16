@@ -1,6 +1,9 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Detection, ScanFile } from './types.js';
+import { DNS_LABEL } from './util/text.js';
+
+const SUPABASE_URL_FALLBACK = new RegExp(`https?://${DNS_LABEL}\\.supabase\\.co`, 'i');
 
 /** Infer the project's frameworks, backends, languages and package managers. */
 export function detect(root: string, files: ScanFile[]): Detection {
@@ -81,8 +84,10 @@ export function detect(root: string, files: ScanFile[]): Detection {
   }
 
   // Content fallback for projects without a package.json — kept strict to avoid
-  // false positives from code that merely mentions a backend by name.
-  if (!backends.has('supabase') && files.some((f) => /https?:\/\/[a-z0-9-]+\.supabase\.co/i.test(f.content))) {
+  // false positives from code that merely mentions a backend by name. Uses the
+  // shared bounded DNS_LABEL (see util/text.ts) so this cannot go quadratic on
+  // a long run of matching characters in a large file.
+  if (!backends.has('supabase') && files.some((f) => SUPABASE_URL_FALLBACK.test(f.content))) {
     backends.add('supabase');
   }
   if (!backends.has('firebase') && files.some((f) => /\binitializeApp\s*\(/.test(f.content) && /firebase/i.test(f.content))) {

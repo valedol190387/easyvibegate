@@ -228,6 +228,17 @@ async function main(): Promise<void> {
   // Reports land next to the scanned project by default, so scanning several
   // projects from one shell never overwrites another project's report.
   const outDir = args.output !== undefined ? resolve(args.output) : join(root, 'easyvibegate-report');
+  // The report directory gets its OWN `.gitignore` (see prepareOutputDir) and
+  // has its stale report files deleted on every run. Both are safe for a
+  // directory that exists only to hold reports — neither is safe for the
+  // scanned project itself: `--output .` from the project root would replace
+  // the project's real .gitignore with a bare `*`, silently un-tracking the
+  // whole repo.
+  if (args.output !== undefined && outDir === root) {
+    process.stderr.write(`easyvibegate: --output must not be the scanned project itself (${root}) — pick a subdirectory, e.g. --output ${join(root, 'easyvibegate-report')}
+`);
+    process.exit(2);
+  }
 
   // Use the friendly wizard when a human runs it in a terminal without
   // automation flags; --wizard forces it. Either way the pipeline below is shared.
@@ -339,6 +350,12 @@ function prepareOutputDir(dir: string): string | null {
   try {
     if (existsSync(dir) && !statSync(dir).isDirectory()) return 'exists and is not a directory';
     mkdirSync(dir, { recursive: true });
+    // The report names secret prefixes, database hosts and every endpoint —
+    // exactly what must not be committed. A `.gitignore` containing `*` inside
+    // the directory makes git ignore it wherever the project's own .gitignore
+    // stands (the trick node_modules-style caches use); the user's files are
+    // never edited. Rewritten every run so a stray edit cannot un-ignore it.
+    writeFileSync(join(dir, '.gitignore'), '# Written by EasyVibeGate: this report can contain secret prefixes and hosts. Never commit it.\n*\n', 'utf8');
     // Old report.md next to a fresh report.json told two different stories.
     for (const name of ['report.md', 'report.json', 'ai-fix-prompt.md']) {
       const p = join(dir, name);

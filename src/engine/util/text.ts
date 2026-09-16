@@ -47,3 +47,16 @@ export function decodeJwtPayload(token: string): Record<string, unknown> | null 
     return null;
   }
 }
+
+/**
+ * A DNS label, bounded to its real maximum (RFC 1035, 63 octets) — never `+`.
+ * Used right before a literal host suffix (`.firebaseapp.com`, `.supabase.co`)
+ * in a regex run against raw, unbounded file content. An open `[a-z0-9-]+` in
+ * that position is a classic quadratic-time regex: at every position inside a
+ * long run of matching characters (a minified bundle, a base64 blob, a lockfile
+ * hash) the engine greedily consumes to the end and backtracks one character at
+ * a time looking for a literal that never comes. Measured: a 500KB matching run
+ * took over two minutes unbounded; bounded, the same file scans in single-digit
+ * milliseconds — and no real hostname label is longer than this anyway.
+ */
+export const DNS_LABEL = '[a-z0-9-]{1,63}';

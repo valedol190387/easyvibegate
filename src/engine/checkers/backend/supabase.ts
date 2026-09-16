@@ -35,7 +35,11 @@ export function classifyKey(key: string): 'jwt-anon' | 'jwt-authenticated' | 'jw
   return 'unknown';
 }
 
-const BARE_URL = /https:\/\/[a-z0-9]{16,}\.supabase\.co/;
+// Bounded for the same reason as the shared `DNS_LABEL` in util/text.ts (a
+// quadratic-time regex on raw file content) — but a Supabase project ref is
+// its own format (no hyphens, {16,63} not {1,63}), so this stays a literal
+// rather than reusing that constant.
+const BARE_URL = /https:\/\/[a-z0-9]{16,63}\.supabase\.co/;
 const BARE_PUBLISHABLE = /\bsb_publishable_[A-Za-z0-9_-]{10,}\b/;
 const BARE_JWT = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g;
 

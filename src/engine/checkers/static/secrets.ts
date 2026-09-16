@@ -1,6 +1,14 @@
 import type { Checker, Finding, Severity } from '../../types.js';
 import { decodeJwtPayload, lineAt, looksLikePlaceholder, redact, shannonEntropy } from '../../util/text.js';
 import { createExposure, type Exposure } from '../../util/git-exposure.js';
+import { partitionIgnores, type VibegateConfig } from '../../config.js';
+
+/** No project-wide rules — used to run ONLY the inline-marker half of partitionIgnores. */
+const EMPTY_CONFIG: VibegateConfig = { ignore: [], ignorePaths: [] };
+
+/** Lower number = more severe. One copy, used both to cap a severity and to rank duplicates. */
+const SEVERITY_RANK: Record<Severity, number> = { critical: 0, warning: 1, info: 2, advisory: 3 };
+const atMost = (sev: Severity, cap: Severity): Severity => (SEVERITY_RANK[sev] < SEVERITY_RANK[cap] ? cap : sev);
 
 interface Pattern {
   id: string;
@@ -190,6 +198,23 @@ const JWT = /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g
 // KEY=value / key: value / Dockerfile ENV|ARG KEY=value, with a secret-looking NAME.
 const ASSIGN = /^[ \t]*(?:export[ \t]+|ENV[ \t]+|ARG[ \t]+)?([A-Za-z_][A-Za-z0-9_.-]*)[ \t]*[:=][ \t]*(.+)$/gm;
 const SECRET_NAME = /(secret|token|password|passwd|private[_-]?key|api[_-]?key|access[_-]?key|credential)/i;
+/**
+ * Shell-style `NAME=value` anywhere in a line, in any file: `PGPASSWORD=… psql`,
+ * `TOKEN=… curl`, a permission rule in .claude/settings.local.json. Upper-case
+ * names only, so prose like "password=…" in docs does not count.
+ *
+ * The leading class is `*` (zero or more), not `+`: a bare name that IS one of
+ * the keywords (`SECRET=…`, `TOKEN=…`, `API_KEY=…`, no prefix at all — an
+ * extremely common shape in real scripts) needs zero characters before the
+ * keyword, and requiring at least one meant those never matched at all. There
+ * is deliberately no trailing lookahead: `{8,}` on a fixed character class
+ * already stops at the first character outside it, so a value followed by
+ * `;`, `)`, `,` or `]` (`export TOKEN=abc123;`, `foo(SECRET=abc123)`) still
+ * matches correctly — an earlier version's trailing negative lookahead
+ * rejected exactly those common shell/call-site endings.
+ */
+// Values are ASCII token characters: `PASSWORD=та_же_что_и_выше` in a README is prose.
+const INLINE_ENV = /\b([A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|ACCESS_KEY|PRIVATE_KEY)[A-Z0-9_]*)=([A-Za-z0-9_\-./+=:@]{8,})/g;
 
 /** Only .env* files are "server env by design" — a secret there is a warning
  *  (env-git flags committing it). In real code/config it stays a source leak. */
@@ -251,8 +276,6 @@ export const secretsChecker: Checker = {
       // looksLikeRealMaterial). A docs/fixture path may only downgrade a
       // heuristic or sample-looking hit to info; proven material stays at
       // warning there — the path lowers confidence, it does not make it safe.
-      const rank: Record<Severity, number> = { critical: 0, warning: 1, info: 2, advisory: 3 };
-      const atMost = (sev: Severity, cap: Severity): Severity => (rank[sev] < rank[cap] ? cap : sev);
 
       /**
        * Severity = what the value is × how it can leak. The pattern says what it
@@ -296,9 +319,16 @@ export const secretsChecker: Checker = {
           // env-git check's finding, not this one's — reporting it twice at
           // warning is what made people stop reading.
           if (env && ex !== 'committed') {
+            // This also covers `ex === 'ignored'`: an env file is always the
+            // right place for a secret whether or not it's ALSO gitignored, so
+            // there is nothing a separate ignored-env-file branch would add.
             out = { ...out, severity: 'advisory', detail: `${out.detail} Not committed — this is where the value belongs; keep the file out of git and out of client bundles.` };
           } else if (ex === 'ignored') {
-            out = { ...out, severity: 'advisory', detail: `${out.detail} This file is gitignored, so the value cannot leak through git — keep it that way and out of client bundles.` };
+            // Gitignored, but not an env file: a credential pasted into a tool
+            // config or a script (a prod DB password inside a permission rule in
+            // .claude/settings.local.json was reported as a mere advisory). It
+            // cannot leak through git today; it still does not belong there.
+            out = { ...out, severity: atMost(out.severity, 'warning'), detail: `${out.detail} The file is gitignored, so this cannot leak through git — but it is a credential pasted into a config/source file, not an env var. Move it to .env (also gitignored) so one \`git add -A\` or a shared zip never carries it.` };
           } else if (ex === 'untracked') {
             out = { ...out, severity: atMost(out.severity, 'warning'), detail: `${out.detail} The file is not committed yet — it is one \`git add -A\` away from being. Add it to .gitignore or move the value to an env var.` };
           } else if (ex === 'no-git') {
@@ -381,6 +411,30 @@ export const secretsChecker: Checker = {
         }, false, value);
       }
 
+      // Inline shell-style assignments mid-line, outside env/config files (those
+      // go through ASSIGN below). A prod DB password inside a permission rule in
+      // .claude/settings.local.json was invisible to both other name-based rules.
+      if (!isConfigish(rel)) {
+        for (const m of content.matchAll(INLINE_ENV)) {
+          const name = m[1] ?? '';
+          const value = m[2] ?? '';
+          if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
+          if (!/[0-9]/.test(value) && value.length < 24) continue;
+          push({
+            id: 'env_secret',
+            severity: 'warning',
+            title: 'Secret in an inline assignment',
+            detail: `"${name}" is assigned a high-entropy value inline in ${rel}: ${redact(value)}`,
+            fix: 'Move the value to a gitignored .env and reference it by name; rotate it if the file was ever shared.',
+            checker: 'secrets',
+            level: 0,
+            file: rel,
+            line: lineAt(content, m.index ?? 0),
+            evidence: redact(value),
+          }, false, value);
+        }
+      }
+
       // name=value / key: value assignments (env, config, Dockerfile ENV/ARG).
       if (isConfigish(rel)) {
         for (const m of content.matchAll(ASSIGN)) {
@@ -410,17 +464,54 @@ export const secretsChecker: Checker = {
 
     // De-duplicate only true repeats: the same secret, same place, same rule.
     // (Keying on file:line alone hid every extra key on a minified line.)
-    const order: Record<Severity, number> = { critical: 0, warning: 1, info: 2, advisory: 3 };
     const seen = new Map<string, Finding>();
     for (const f of findings) {
       const key = `${f.file ?? ''}:${f.line ?? 0}:${f.id}:${f.evidence ?? ''}`;
       const cur = seen.get(key);
-      if (!cur || order[f.severity] < order[cur.severity]) seen.set(key, f);
+      if (!cur || SEVERITY_RANK[f.severity] < SEVERITY_RANK[cur.severity]) seen.set(key, f);
     }
     // A vendor pattern or a decoded JWT already identifies the value on a line;
     // the name-based env_secret / generic_secret there is the same fact twice.
     const NAME_BASED = new Set(['env_secret', 'generic_secret']);
     const specificAt = new Set([...seen.values()].filter((f) => !NAME_BASED.has(f.id)).map((f) => `${f.file ?? ''}:${f.line ?? 0}`));
-    return [...seen.values()].filter((f) => !(NAME_BASED.has(f.id) && specificAt.has(`${f.file ?? ''}:${f.line ?? 0}`)));
+    const kept = [...seen.values()].filter((f) => !(NAME_BASED.has(f.id) && specificAt.has(`${f.file ?? ''}:${f.line ?? 0}`)));
+
+    // Eleven advisories saying "secret in gitignored .env.local — fine" are one
+    // observation printed eleven times. Fold them into one line per file that
+    // names the variables; anything above advisory stays line by line.
+    //
+    // The final `applyIgnores` pass (scan.ts) only sees whatever this checker
+    // returns — once N findings become one summary Finding with a single
+    // `line`, a `// easyvibegate-ignore` comment placed above any secret but
+    // the first in the group can no longer reach it. Filter each candidate
+    // through the SAME inline-marker check first (an empty config so only the
+    // marker, not project-wide `ignore`/`ignorePaths` rules, applies here —
+    // those still run again, correctly, against whatever this returns), so an
+    // individually silenced secret is dropped before folding, not after.
+    const byFile = new Map<string, Finding[]>();
+    for (const f of kept) {
+      if (f.id !== 'env_secret' || f.severity !== 'advisory' || !isEnvFile(f.file ?? '')) continue;
+      byFile.set(f.file ?? '', [...(byFile.get(f.file ?? '') ?? []), f]);
+    }
+    const folded = new Set<Finding>();
+    const summaries: Finding[] = [];
+    for (const [file, allCandidates] of byFile) {
+      const group = partitionIgnores(allCandidates, EMPTY_CONFIG, ctx.files).kept;
+      // A member the marker silenced must not reappear individually either —
+      // it is done with, not merely "too few left to fold".
+      for (const f of allCandidates) if (!group.includes(f)) folded.add(f);
+      if (group.length < 2) continue;
+      for (const f of group) folded.add(f);
+      const names = group.map((f) => /^"([^"]+)"/.exec(f.detail)?.[1] ?? '?');
+      const first = group.reduce((a, b) => ((a.line ?? 0) <= (b.line ?? 0) ? a : b));
+      summaries.push({
+        ...first,
+        title: `${group.length} secrets in ${file} (not committed — where they belong)`,
+        detail: `${file} holds ${group.length} secret-looking values (${names.join(', ')}). The file is not committed, so nothing leaks through git; keep it that way and out of client bundles.`,
+        fix: 'Nothing to change here. Keep the file gitignored; rotate any value that may ever have been committed or shared.',
+        evidence: undefined,
+      });
+    }
+    return [...kept.filter((f) => !folded.has(f)), ...summaries];
   },
 };
