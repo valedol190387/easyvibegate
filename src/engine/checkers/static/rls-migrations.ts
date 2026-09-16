@@ -760,6 +760,38 @@ export const rlsMigrationsChecker: Checker = {
         line: s.line,
       });
     }
+
+    // A DISABLE on a table this repo never shows being created is not "no
+    // information" — the instruction is right there, in the file being
+    // scanned. Either the table is real (created from the dashboard, or in a
+    // migration outside this repo) and RLS on it is now off, or it does not
+    // exist and this is a no-op; either way `!s.created` above silently
+    // dropped it, and it stayed dropped even when another table in the same
+    // project WAS found (satisfying the project-level "learned something"
+    // check elsewhere in this function). An ENABLE on an unmanaged table is
+    // the opposite, expected shape — someone correctly protecting a table
+    // this repo doesn't own — and is deliberately not flagged; only the LAST
+    // local instruction for the key matters, same as `state.enabled` already
+    // tracks for tables created here.
+    const lastToggleOnUnknown = new Map<string, Event>();
+    for (const e of events) {
+      if (e.kind === 'enable' || e.kind === 'disable') lastToggleOnUnknown.set(e.key, e); // apply order: last write wins
+    }
+    for (const [key, e] of lastToggleOnUnknown) {
+      if (isTempKey(key) || state.get(key)?.created || e.kind !== 'disable') continue;
+      findings.push({
+        id: 'rls_missing',
+        severity: 'warning',
+        title: `Table "${e.display}" has RLS disabled here, but is never created in this repo`,
+        detail: `"${e.display}" is not created by any migration this scan can see, but this file explicitly disables Row Level Security on it. Either the table is real — created from the dashboard, or in a migration outside this repo — and RLS on it is now off, or it does not exist and this is a no-op. This cannot be told apart statically — check the deployed state.`,
+        fix: `Confirm whether "${e.display}" exists in the deployed database. If it does, re-enable RLS: ALTER TABLE ${e.display} ENABLE ROW LEVEL SECURITY; and add an owner/tenant policy.`,
+        checker: 'rls-migrations',
+        level: 0,
+        file: e.file,
+        line: e.line,
+      });
+    }
+
     // Zero findings can mean two very different things: every table here has
     // RLS handled correctly, or no table definition was ever found in the SQL
     // at all — a maintenance script (`SELECT now();`), a seed file with no

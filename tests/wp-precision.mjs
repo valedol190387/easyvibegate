@@ -656,3 +656,52 @@ console.log('\nWP precision (re-check of the code-review fixes)');
   });
   rmSync(dir2, { recursive: true, force: true });
 }
+
+// An explicit DISABLE, sitting right in a scanned migration, on a table this
+// repo never shows being created must not vanish just because another table
+// IN THE SAME FILE was found — that satisfied the project-level "learned
+// something" check while the dangerous instruction next to it went unseen.
+{
+  const dir = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'CREATE TABLE public.notes(id uuid);\nALTER TABLE public.notes ENABLE ROW LEVEL SECURITY;\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n',
+  });
+  const r = await scanStatic(dir);
+  const s = summarize(r.findings, r.runs);
+  check('a DISABLE on a table never created locally is reported, even next to a clean known table', () => {
+    const f = r.findings.find((x) => x.id === 'rls_missing' && /orders/.test(x.title));
+    assert.ok(f, `got ${JSON.stringify(r.findings.map((x) => [x.id, x.title]))}`);
+    assert.strictEqual(f.severity, 'warning');
+    assert.match(f.title, /never created in this repo/);
+    assert.strictEqual(s.gate, 'warn');
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // Negative: an ENABLE (not disable) on an unmanaged table is the expected,
+  // safe shape and must not be flagged.
+  const dir2 = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'CREATE TABLE public.notes(id uuid);\nALTER TABLE public.notes ENABLE ROW LEVEL SECURITY;\nALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n',
+  });
+  const r2 = await scanStatic(dir2);
+  check('negative: an ENABLE on a table never created locally is not flagged', () => {
+    assert.ok(!r2.findings.some((f) => /orders/.test(f.title ?? '')), JSON.stringify(r2.findings.map((f) => f.title)));
+    assert.strictEqual(summarize(r2.findings, r2.runs).gate, 'pass');
+  });
+  rmSync(dir2, { recursive: true, force: true });
+
+  // Negative: a table that IS created locally still uses the normal path
+  // (critical, not this warning), even when disabled after being enabled.
+  const dir3 = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'CREATE TABLE public.orders(id uuid);\nALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n',
+  });
+  const r3 = await scanStatic(dir3);
+  check('negative: a DISABLE on a table created in THIS file stays the normal critical finding', () => {
+    const f = r3.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f);
+    assert.strictEqual(f.severity, 'critical');
+    assert.ok(!/never created in this repo/.test(f.title));
+  });
+  rmSync(dir3, { recursive: true, force: true });
+}
