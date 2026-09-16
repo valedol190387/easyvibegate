@@ -6,7 +6,7 @@ import { rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { scanStatic } from '../dist/engine/scan.js';
-import { summarize } from '../dist/engine/report.js';
+import { summarize, exitCodeFor } from '../dist/engine/report.js';
 import { check, fixture, ids, runCli } from './_harness.mjs';
 
 console.log('\nWP precision (real-project ground truth)');
@@ -291,13 +291,18 @@ console.log('\nWP precision (untested stacks, self-review)');
 {
   // A Supabase project that ships no .sql migrations at all (schema managed from
   // the dashboard) used to say nothing about RLS — a silent, undeserved clean
-  // score on the exact check this tool exists for.
+  // score on the exact check this tool exists for. This IS the "unknown must
+  // not read as clean" case (unlike the SQLite/D1 skip, which genuinely does
+  // not apply): the check applies but could not run, so it must reduce
+  // coverage, not just add an info line next to an otherwise-green gate.
   const dir = fixture({ 'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n', 'src/x.ts': 'export const x = 1;\n' });
   const r = await scanStatic(dir);
   const s = summarize(r.findings, r.runs);
-  check('a Supabase project with zero SQL migrations reports the gap instead of silence', () => {
+  check('a Supabase project with zero SQL migrations reports the gap AND makes coverage incomplete', () => {
     assert.ok(ids(r).includes('rls_unverifiable_no_migrations'), `got ${ids(r)}`);
-    assert.strictEqual(s.gate, 'pass', 'an info-level gap must not fail the gate');
+    assert.strictEqual(r.runs.find((x) => x.id === 'static:rls-migrations')?.status, 'partial');
+    assert.strictEqual(s.gate, 'incomplete', 'a genuinely unverified check must not leave the gate at pass');
+    assert.strictEqual(exitCodeFor(s), 3);
   });
   rmSync(dir, { recursive: true, force: true });
 
@@ -428,6 +433,104 @@ console.log('\nWP precision (untested stacks, self-review)');
   check('negative: with no ignore comment, all three secrets fold into one summary', () => {
     assert.strictEqual(env2.length, 1, JSON.stringify(env2));
     assert.match(env2[0].title, /3 secrets/);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+}
+
+// --- from a second external re-check of the review fixes ---------------------
+console.log('\nWP precision (re-check of the code-review fixes)');
+
+// --output must never touch a directory it did not create, anywhere it points.
+{
+  const dir = fixture({ 'index.ts': 'const a = 1;\n', 'docs/.gitignore': 'drafts/\nnotes.md\n', 'docs/report.md': 'my important draft doc\n' });
+  const before = readFileSync(join(dir, 'docs', '.gitignore'), 'utf8');
+  const p = runCli([dir, '--no-wizard', '--format', 'json', '--output', join(dir, 'docs')]);
+  check('--output at an existing, non-empty, non-EasyVibeGate directory is refused', () => {
+    assert.strictEqual(p.status, 2, `expected exit 2, got ${p.status}: ${p.stderr}`);
+    assert.match(p.stderr, /was not created by a previous EasyVibeGate run/);
+  });
+  check('the real docs/.gitignore and docs/report.md are untouched after the refusal', () => {
+    assert.strictEqual(readFileSync(join(dir, 'docs', '.gitignore'), 'utf8'), before);
+    assert.strictEqual(readFileSync(join(dir, 'docs', 'report.md'), 'utf8'), 'my important draft doc\n');
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // Negative: re-running against a directory EasyVibeGate itself created is still fine.
+  const dir2 = fixture({ 'index.ts': 'const a = 1;\n' });
+  const out = join(dir2, 'reports');
+  const p1 = runCli([dir2, '--no-wizard', '--format', 'json', '--output', out]);
+  const p2 = runCli([dir2, '--no-wizard', '--format', 'json', '--output', out]);
+  check('negative: reusing a directory from a PREVIOUS EasyVibeGate run still succeeds', () => {
+    assert.strictEqual(p1.status, 0, p1.stderr);
+    assert.strictEqual(p2.status, 0, p2.stderr);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+}
+
+// A "cache"/"tmp" directory under an ordinary source root is not data.
+{
+  const rnd = 'GU1VbXk3QzR0Zks5THN6UDhtWDJhSjZ2ECA';
+  const dir = fixture({
+    'src/cache/index.ts': 'const opts = { algorithm: "none" };\n',
+    'var/tmp/x.json': `{"pagination_token":"${rnd}"}\n`,
+  });
+  const r = await scanStatic(dir);
+  check('src/cache (parent is an ordinary source root) is scanned, not skipped', () => {
+    assert.ok(r.files.some((f) => f.rel === 'src/cache/index.ts'), 'src/cache/index.ts was invisible to the walk');
+    assert.ok(ids(r).includes('jwt_alg_none'), `got ${ids(r)}`);
+  });
+  check('negative: var/tmp (a data-ish parent, same depth as data/cache) is still excluded', () => {
+    assert.ok(!r.files.some((f) => f.rel.startsWith('var/tmp/')));
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// The RLS fix text must not assume an `anon` role exists where there is none.
+{
+  const dir = fixture({ 'package.json': '{"name":"x","dependencies":{"pg":"^8"}}\n', 'db/1.sql': 'CREATE TABLE orders (id serial);\n' });
+  const r = await scanStatic(dir);
+  const f = r.findings.find((x) => x.id === 'rls_missing');
+  check('a server-only Postgres warning does not tell the user to revoke privileges from a role ("anon") that does not exist', () => {
+    assert.ok(f);
+    assert.ok(!/FROM anon/.test(f.fix), `fix still mentions anon: ${f.fix}`);
+    assert.match(f.fix, /No action needed unless/);
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  const dir2 = fixture({ 'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n', 'db/1.sql': 'CREATE TABLE orders (id serial);\n' });
+  const r2 = await scanStatic(dir2);
+  const f2 = r2.findings.find((x) => x.id === 'rls_missing');
+  check('negative: an exposed Supabase project still gets the concrete REVOKE FROM anon step', () => {
+    assert.ok(f2);
+    assert.match(f2.fix, /REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON orders FROM anon/);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+}
+
+// A tool's own test suite / comments describing a backend must not make the
+// project itself look like it uses that backend (dogfooding on EasyVibeGate's
+// own repo found this twice: a literal mock URL in tests/, then the same
+// literal in an explanatory source comment).
+{
+  const dir = fixture({
+    'tests/supabase.test.ts': 'const url = "https://p.supabase.co"; // mock\n',
+    'src/detect.ts': '// A real URL looks like https://p.supabase.co — do not match one here.\nexport const x = 1;\n',
+    'db/1.sql': 'CREATE TABLE orders (id serial);\nALTER TABLE orders ENABLE ROW LEVEL SECURITY;\n',
+  });
+  const r = await scanStatic(dir);
+  check('a mock URL in a test file does not make the project look like it uses that backend', () => {
+    assert.ok(!r.detection.backends.includes('supabase'), `backends: ${JSON.stringify(r.detection.backends)}`);
+  });
+  check('the same URL shape inside a source comment (not a string) does not either', () => {
+    assert.ok(!r.detection.backends.includes('supabase'), `backends: ${JSON.stringify(r.detection.backends)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // Negative: the same URL as a real, non-test, non-comment value is still detected.
+  const dir2 = fixture({ 'src/config.ts': 'export const url = "https://p.supabase.co";\n' });
+  const r2 = await scanStatic(dir2);
+  check('negative: a real Supabase URL in ordinary source is still detected', () => {
+    assert.ok(r2.detection.backends.includes('supabase'), `backends: ${JSON.stringify(r2.detection.backends)}`);
   });
   rmSync(dir2, { recursive: true, force: true });
 }

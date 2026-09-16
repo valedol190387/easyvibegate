@@ -60,3 +60,18 @@ export function decodeJwtPayload(token: string): Record<string, unknown> | null 
  * milliseconds — and no real hostname label is longer than this anyway.
  */
 export const DNS_LABEL = '[a-z0-9-]{1,63}';
+
+/**
+ * Documentation, examples and test/fixture paths — where a sample config
+ * value (a fake Supabase URL, a placeholder key) legitimately lives without
+ * describing anything about the real project. A test suite for code that
+ * TALKS to a backend routinely contains literal-looking URLs/keys for that
+ * backend as mock data; without this, scanning a project's own tests can
+ * make the project appear to use a backend it merely tests against.
+ */
+export function looksLikeTestOrDocPath(rel: string): boolean {
+  return /\.(md|txt|mdx|rst)$/i.test(rel)
+    || /\.(example|sample|template|dist)$/i.test(rel)
+    || /(^|\/)(docs?|examples?|fixtures?|__fixtures__|__tests__|test|tests|spec|__mocks__)(\/|$)/i.test(rel)
+    || /\.(test|spec)\.[a-z]+$/i.test(rel);
+}

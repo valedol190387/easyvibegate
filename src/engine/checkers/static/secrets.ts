@@ -1,5 +1,5 @@
 import type { Checker, Finding, Severity } from '../../types.js';
-import { decodeJwtPayload, lineAt, looksLikePlaceholder, redact, shannonEntropy } from '../../util/text.js';
+import { decodeJwtPayload, lineAt, looksLikePlaceholder, looksLikeTestOrDocPath, redact, shannonEntropy } from '../../util/text.js';
 import { createExposure, type Exposure } from '../../util/git-exposure.js';
 import { partitionIgnores, type VibegateConfig } from '../../config.js';
 
@@ -228,16 +228,10 @@ function isConfigish(rel: string): boolean {
     || /(^|\/)(Dockerfile|\.npmrc|\.netrc)$/.test(rel) || /docker-compose\.ya?ml$/.test(rel);
 }
 
-/**
- * Documentation, examples and test fixtures are where sample keys legitimately
- * live. A hit there is worth mentioning but is not a credential leak.
- */
-function isExampleContext(rel: string): boolean {
-  return /\.(md|txt|mdx|rst)$/i.test(rel)
-    || /\.(example|sample|template|dist)$/i.test(rel)
-    || /(^|\/)(docs?|examples?|fixtures?|__fixtures__|__tests__|test|tests|spec|__mocks__)(\/|$)/i.test(rel)
-    || /\.(test|spec)\.[a-z]+$/i.test(rel);
-}
+// Documentation, examples and test fixtures are where sample keys legitimately
+// live. A hit there is worth mentioning but is not a credential leak.
+// (shared: also used by detect.ts, to keep a project's own test suite for
+// backend-talking code from making the project look like it uses that backend.)
 
 export const secretsChecker: Checker = {
   id: 'secrets',
@@ -269,7 +263,7 @@ export const secretsChecker: Checker = {
       const { rel } = file;
       const content = file.content.replace(/^\uFEFF/, ''); // a BOM must not eat line 1
       const env = isEnvFile(rel);
-      const example = isExampleContext(rel);
+      const example = looksLikeTestOrDocPath(rel);
       const ex: Exposure = exposure(rel);
 
       // `proven` = the hit is structurally real key material (see

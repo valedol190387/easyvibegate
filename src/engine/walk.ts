@@ -18,19 +18,27 @@ const SKIP_DIRS = new Set([
 
 /**
  * Names ambiguous enough that they are sometimes real source (a module named
- * "cache", a package called "tmp") and sometimes pure data. Skipped only when
- * `relDir` (the ambiguous directory's own path, relative to the project root,
- * e.g. "cache" or "data/cache") has at most 2 path segments — i.e. the
- * directory IS the root's own child, or is nested exactly one level below it.
- * The real-world evidence for this was `data/cache/*.json` full of API
- * pagination tokens, 559 of 569 "generic secrets" in one real project. Deeper
- * nesting (`apps/api/src/lib/cache/`, 4 segments) is ordinary source and stays
- * scanned; blanket name-matching at any depth once made a source directory
- * invisible to every check with no visible coverage gap.
+ * "cache", a package called "tmp") and sometimes pure data. Path depth alone
+ * does not tell them apart: `src/cache` and `data/cache` are both 2 segments,
+ * but the first is exactly as likely to be a project's own source directory
+ * (a caching module) as the second is to be scan output. What DOES tell them
+ * apart is the parent: a data-ish parent name (`data`, `var`, `storage`) means
+ * generated/fetched content; an ordinary source-tree parent does not. Skipped
+ * only when the ambiguous name is the project root's own child (`cache/`,
+ * `tmp/` at the top level), or its immediate parent is one of those data-ish
+ * names (`data/cache`, `var/tmp`). The real-world evidence for this was
+ * `data/cache/*.json` full of API pagination tokens, 559 of 569 "generic
+ * secrets" in one real project; blanket name-matching at any depth once made
+ * a source directory invisible to every check with no visible coverage gap,
+ * and matching by depth alone reopened that exact gap for `src/cache`.
  */
 const AMBIGUOUS_DATA_DIRS = new Set(['cache', 'caches', 'tmp', 'temp', '.tmp']);
-const isShallowDataDir = (name: string, relDir: string): boolean =>
-  AMBIGUOUS_DATA_DIRS.has(name) && relDir.split('/').length <= 2;
+const DATA_ISH_PARENTS = new Set(['data', 'var', 'storage']);
+const isShallowDataDir = (name: string, relDir: string): boolean => {
+  if (!AMBIGUOUS_DATA_DIRS.has(name)) return false;
+  const segs = relDir.split('/');
+  return segs.length === 1 || (segs.length === 2 && DATA_ISH_PARENTS.has((segs[0] ?? '').toLowerCase()));
+};
 
 const TEXT_EXT = new Set([
   '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.vue', '.svelte',

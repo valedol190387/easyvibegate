@@ -192,7 +192,14 @@ await (async () => {
 
 await (async () => {
   // Negative: an auto-discovered backend declined at the prompt is a voluntary skip.
-  const dir = fixture({ 'z.ts': sbFile(CURRENT) });
+  // A clean, RLS-enabled migration is included so this stays focused on the
+  // consent-decline behavior — a Supabase project with NO migrations at all
+  // is its own, separately-tested case (rls_unverifiable_no_migrations),
+  // which correctly makes the gate incomplete rather than a silent pass.
+  const dir = fixture({
+    'z.ts': sbFile(CURRENT),
+    'db/1.sql': 'CREATE TABLE public.notes (id uuid);\nALTER TABLE public.notes ENABLE ROW LEVEL SECURITY;\n',
+  });
   const r = await runFlow({ root: dir, consent: async () => false });
   check('C02 negative: auto-discovered Supabase declined is skipped and the gate stays pass', () => {
     const run = r.runs.find((x) => x.id === 'supabase-probe');

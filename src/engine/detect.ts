@@ -1,7 +1,8 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Detection, ScanFile } from './types.js';
-import { DNS_LABEL } from './util/text.js';
+import { DNS_LABEL, looksLikeTestOrDocPath } from './util/text.js';
+import { maskCode } from './util/mask.js';
 
 const SUPABASE_URL_FALLBACK = new RegExp(`https?://${DNS_LABEL}\\.supabase\\.co`, 'i');
 
@@ -87,10 +88,23 @@ export function detect(root: string, files: ScanFile[]): Detection {
   // false positives from code that merely mentions a backend by name. Uses the
   // shared bounded DNS_LABEL (see util/text.ts) so this cannot go quadratic on
   // a long run of matching characters in a large file.
-  if (!backends.has('supabase') && files.some((f) => SUPABASE_URL_FALLBACK.test(f.content))) {
+  //
+  // Two independent guards against a project's own code making itself look
+  // like it uses a backend it only mentions: test/fixture files are excluded
+  // (a test suite for code that talks to Supabase routinely contains
+  // synthetic mock URLs shaped like a real project's own), and comments are
+  // masked before matching (an explanatory comment describing that exact URL
+  // shape is otherwise itself a match). Both were needed: this fallback once
+  // made EasyVibeGate's own test suite, and separately its own source
+  // comments, detect EasyVibeGate itself as a Supabase project — a security
+  // scanner flagging itself is exactly what dogfooding exists to catch.
+  // Strings are NOT masked: a real URL/call normally appears in one.
+  const nonTestFiles = files.filter((f) => !looksLikeTestOrDocPath(f.rel));
+  const codeOnly = (f: Pick<ScanFile, 'content' | 'rel'>) => maskCode(f.content, { file: f.rel });
+  if (!backends.has('supabase') && nonTestFiles.some((f) => SUPABASE_URL_FALLBACK.test(codeOnly(f)))) {
     backends.add('supabase');
   }
-  if (!backends.has('firebase') && files.some((f) => /\binitializeApp\s*\(/.test(f.content) && /firebase/i.test(f.content))) {
+  if (!backends.has('firebase') && nonTestFiles.some((f) => { const c = codeOnly(f); return /\binitializeApp\s*\(/.test(c) && /firebase/i.test(c); })) {
     backends.add('firebase');
   }
 

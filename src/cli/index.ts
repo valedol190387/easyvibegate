@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { planTargets, runFlow, type ConsentRequest } from '../orchestrator/flow.js';
@@ -345,17 +345,33 @@ async function main(): Promise<void> {
   process.exit(exitCodeFor(summary));
 }
 
+// Written verbatim (never partially, never appended-to) so an exact match on
+// disk is proof WE created this directory, not the user re-pointing --output
+// at a folder of their own. Checking "does outDir === project root" only was
+// not enough: `--output docs` on a real docs/ folder replaced its real
+// .gitignore (losing rules like `drafts/`) and deleted a real docs/report.md.
+const OUTPUT_DIR_MARKER = '# Written by EasyVibeGate: this report can contain secret prefixes and hosts. Never commit it.\n*\n';
+
 /** Create the report dir and clear our own stale files, or explain why we cannot. */
 function prepareOutputDir(dir: string): string | null {
   try {
-    if (existsSync(dir) && !statSync(dir).isDirectory()) return 'exists and is not a directory';
+    const existed = existsSync(dir);
+    if (existed && !statSync(dir).isDirectory()) return 'exists and is not a directory';
+    if (existed) {
+      const ownsIt = existsSync(join(dir, '.gitignore')) && readFileSync(join(dir, '.gitignore'), 'utf8') === OUTPUT_DIR_MARKER;
+      if (!ownsIt && readdirSync(dir).length > 0) {
+        return 'already exists, is not empty, and was not created by a previous EasyVibeGate run — refusing to overwrite its .gitignore or delete files in it; point --output at an empty or dedicated directory';
+      }
+    }
     mkdirSync(dir, { recursive: true });
     // The report names secret prefixes, database hosts and every endpoint —
     // exactly what must not be committed. A `.gitignore` containing `*` inside
     // the directory makes git ignore it wherever the project's own .gitignore
     // stands (the trick node_modules-style caches use); the user's files are
-    // never edited. Rewritten every run so a stray edit cannot un-ignore it.
-    writeFileSync(join(dir, '.gitignore'), '# Written by EasyVibeGate: this report can contain secret prefixes and hosts. Never commit it.\n*\n', 'utf8');
+    // never edited. Rewritten every run so a stray edit cannot un-ignore it —
+    // safe now because we only ever reach this line for a directory that was
+    // either empty or already marked as ours.
+    writeFileSync(join(dir, '.gitignore'), OUTPUT_DIR_MARKER, 'utf8');
     // Old report.md next to a fresh report.json told two different stories.
     for (const name of ['report.md', 'report.json', 'ai-fix-prompt.md']) {
       const p = join(dir, name);

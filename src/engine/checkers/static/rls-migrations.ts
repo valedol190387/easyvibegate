@@ -557,22 +557,34 @@ export const rlsMigrationsChecker: Checker = {
       // (schema managed from the dashboard, or migrations live in another repo)
       // used to just say nothing — a silent, undeserved clean score on the exact
       // check the tool exists for. Say what could not be checked instead.
-      const looksSupabase =
-        ctx.detection.backends.includes('supabase') ||
-        ctx.files.some(
-          (f) => !/\.(md|mdx|txt|rst)$/i.test(f.rel) &&
-            /(SUPABASE_(?:ANON|PUBLISHABLE)_KEY|sb_publishable_|\/rest\/v1\b|postgrest)/i.test(f.content),
-        );
-      if (!looksSupabase) return [];
-      return [{
-        id: 'rls_unverifiable_no_migrations',
-        severity: 'info',
-        title: 'No SQL migrations found — RLS could not be checked statically',
-        detail: 'This project talks to Supabase, but no .sql migration files exist in this repository (the schema may be managed from the dashboard, or migrations live in a different repo). A static scan can only see table/RLS state from files it can read, so no table here could be verified this way — this is missing information, not a clean result.',
-        fix: 'Run the live probe (consent + --i-own-this) to enumerate which tables the anon key can read, or check pg_class.relrowsecurity and pg_policies directly in the Supabase SQL editor.',
-        checker: 'rls-migrations',
-        level: 0,
-      }];
+      // The SAME signal `exposed`/`pgProject` use below, not a separate, looser
+      // one: a bespoke regex here (bare `SUPABASE_ANON_KEY`/`postgrest`/etc.
+      // anywhere in any file) matched this very file, which mentions those
+      // strings as the patterns it detects them WITH — a security scanner
+      // that flags itself as a Supabase project is exactly the kind of
+      // self-referential false positive dogfooding exists to catch. A real
+      // Supabase project's client library dependency is enough to detect it;
+      // `ctx.detection.backends` already carries that, hardened project-wide.
+      if (!ctx.detection.backends.includes('supabase')) return [];
+      // This is the exact "unknown ≠ clean" case the tool exists to catch: the
+      // check APPLIES (unlike the SQLite/D1 skip below, which is genuinely not
+      // applicable and rightly leaves the gate alone) but could not run. An
+      // info-only finding left the gate at `pass` and coverage.incomplete at
+      // `false` — a minimal Supabase project with zero SQL scored 98/100 PASS,
+      // exit 0, with RLS on every real table entirely unverified. `partial`
+      // makes the run status reflect that: gate incomplete, exit 3.
+      return {
+        findings: [{
+          id: 'rls_unverifiable_no_migrations',
+          severity: 'info',
+          title: 'No SQL migrations found — RLS could not be checked statically',
+          detail: 'This project talks to Supabase, but no .sql migration files exist in this repository (the schema may be managed from the dashboard, or migrations live in a different repo). A static scan can only see table/RLS state from files it can read, so no table here could be verified this way — this is missing information, not a clean result.',
+          fix: 'Run the live probe (consent + --i-own-this) to enumerate which tables the anon key can read, or check pg_class.relrowsecurity and pg_policies directly in the Supabase SQL editor.',
+          checker: 'rls-migrations',
+          level: 0,
+        }],
+        partial: 'no SQL migrations found for a Supabase project — RLS could not be checked for any table',
+      };
     }
 
     // RLS is a PostgreSQL feature. The engine is decided per FILE, not per
@@ -757,7 +769,15 @@ export const rlsMigrationsChecker: Checker = {
             : kind === 'order'
               ? `"${s.display}" has statements in directories other than "${s.stateFile}" that contradict its final RLS state. Files in separate directories have no reliable apply order, so this cannot be decided statically — check the deployed state.`
               : `"${s.display}" has a table or RLS statement whose execution cannot be confirmed statically: inside an IF/LOOP branch or a block with an EXCEPTION handler, after a RETURN, in a rolled-back or unterminated transaction, or on a name a TEMP table may shadow. Whether it took effect cannot be decided without running the migration, so its RLS state is NOT confirmed — check the deployed state.`,
-        fix: `ALTER TABLE ${s.display} ENABLE ROW LEVEL SECURITY; then add an owner/tenant policy, and drop any permissive "USING (true)" policy (policies are OR-ed). Until policies exist, stop the bleeding without breaking reads: REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${s.display} FROM anon; This is a static hint — confirm the deployed state.`,
+        // The REVOKE-from-anon step only makes sense where an `anon` role is a
+        // real thing to revoke from — the same condition `missingSeverity`
+        // itself uses. Recommending it unconditionally told a server-only
+        // Postgres user (no Supabase, no anon role) to revoke privileges from
+        // a role that does not exist in their database, right next to a
+        // detail explaining that RLS is not needed there at all.
+        fix: exposed || !serverOnly
+          ? `ALTER TABLE ${s.display} ENABLE ROW LEVEL SECURITY; then add an owner/tenant policy, and drop any permissive "USING (true)" policy (policies are OR-ed). Until policies exist, stop the bleeding without breaking reads: REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${s.display} FROM anon; This is a static hint — confirm the deployed state.`
+          : `No action needed unless a client-facing data API (Supabase/PostgREST, Hasura) is ever put in front of this database — if it is, first ALTER TABLE ${s.display} ENABLE ROW LEVEL SECURITY and add an owner/tenant policy, then REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${s.display} FROM the role that API uses to connect.`,
         checker: 'rls-migrations',
         level: 0,
         file: s.file,
