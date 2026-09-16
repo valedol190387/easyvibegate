@@ -228,6 +228,12 @@ async function main(): Promise<void> {
   // Reports land next to the scanned project by default, so scanning several
   // projects from one shell never overwrites another project's report.
   const outDir = args.output !== undefined ? resolve(args.output) : join(root, 'easyvibegate-report');
+  // Excluding outDir from the scan only makes sense when something is
+  // actually going to be written there. With --no-report (format 'none'),
+  // nothing is ever written to it — so a `--no-report --output <project>/src`
+  // run must not exclude real source just because it shares a path with an
+  // output directory nothing will use.
+  const excludeOutDir = args.format !== 'none' ? [outDir] : [];
   // The report directory gets its OWN `.gitignore` (see prepareOutputDir) and
   // has its stale report files deleted on every run. Both are safe for a
   // directory that exists only to hold reports — neither is safe for the
@@ -263,7 +269,7 @@ async function main(): Promise<void> {
   let result;
   if (useWizard) {
     result = await runWizard({
-      excludeAbs: [outDir],
+      excludeAbs: excludeOutDir,
       path: args.path,
       config: args.config,
       lang,
@@ -288,7 +294,7 @@ async function main(): Promise<void> {
     };
     // Same contract as the wizard: plan the concrete targets once, ask about
     // exactly those, execute exactly those.
-    const staticResult = await scanStatic(root, { configPath: args.config, excludeAbs: [outDir] });
+    const staticResult = await scanStatic(root, { configPath: args.config, excludeAbs: excludeOutDir });
     const plan = planTargets(staticResult.files, loadConfig(root, args.config), {
       appUrl: args.appUrl,
       supabaseUrl: args.supabaseUrl,

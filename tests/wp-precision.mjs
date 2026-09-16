@@ -609,9 +609,14 @@ console.log('\nWP precision (re-check of the code-review fixes)');
     'supabase/seed.sql': 'CREATE TEMP TABLE staging(id uuid);\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n',
   });
   const r2 = await scanStatic(dir2);
-  check('the same, plus a DISABLE on a table never defined locally, still reports the gap (not silence)', () => {
-    assert.ok(ids(r2).includes('rls_unverifiable_no_migrations'), `got ${ids(r2)}`);
-    assert.strictEqual(summarize(r2.findings, r2.runs).gate, 'incomplete');
+  check('the same, plus a DISABLE on a table never defined locally, reports THAT specific table (not just the generic gap)', () => {
+    // The unified per-table model (0.6.7) reports the real, specific finding
+    // instead of falling back to the generic "no schema learned" message —
+    // strictly more informative than the earlier fix's fallback-only result.
+    const f = r2.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `got ${ids(r2)}`);
+    assert.match(f.title, /orders.*never created in this repo/);
+    assert.strictEqual(summarize(r2.findings, r2.runs).gate, 'warn');
   });
   rmSync(dir2, { recursive: true, force: true });
 
@@ -704,4 +709,412 @@ console.log('\nWP precision (re-check of the code-review fixes)');
     assert.ok(!/never created in this repo/.test(f.title));
   });
   rmSync(dir3, { recursive: true, force: true });
+}
+
+// F01 (0.6.7): the per-table model is unified — DROP, RENAME, guards and
+// cross-directory order apply the SAME way to a table this repo never
+// creates as they already did to one it does. A second, separate model for
+// "external" tables (0.6.6) did not know any of that on its own.
+{
+  // A table created, disabled, then DROPped is known and gone — not a warning.
+  const dir = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'CREATE TABLE public.orders(id uuid);\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\nDROP TABLE public.orders;\n',
+  });
+  const r = await scanStatic(dir);
+  check('F01: CREATE, DISABLE, then DROP is a clean pass — the table no longer exists', () => {
+    assert.ok(!ids(r).includes('rls_missing'), `got ${JSON.stringify(r.findings.map((f) => f.title))}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // A table created, disabled, renamed, then re-enabled under the new name is clean.
+  const dir2 = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'CREATE TABLE public.orders(id uuid);\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\nALTER TABLE public.orders RENAME TO orders_archive;\nALTER TABLE public.orders_archive ENABLE ROW LEVEL SECURITY;\n',
+  });
+  const r2 = await scanStatic(dir2);
+  check('F01: CREATE, DISABLE, RENAME, then ENABLE under the new name is a clean pass', () => {
+    assert.ok(!ids(r2).includes('rls_missing'), `got ${JSON.stringify(r2.findings.map((f) => f.title))}`);
+  });
+  rmSync(dir2, { recursive: true, force: true });
+
+  // An unconditional external DISABLE is not cleared by a LATER conditional
+  // (possibly-never-runs) ENABLE on the same external table.
+  const dir3 = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': "ALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\nDO $$ BEGIN\n  IF false THEN\n    ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n  END IF;\nEND $$;\n",
+  });
+  const r3 = await scanStatic(dir3);
+  check('F01: an unconditional external DISABLE survives a later conditional ENABLE — still a warning', () => {
+    const f = r3.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `got ${ids(r3)}`);
+    assert.match(f.title, /orders/);
+  });
+  rmSync(dir3, { recursive: true, force: true });
+
+  // Cross-directory DISABLE/ENABLE on an external table is ambiguous, not clean.
+  const dir4 = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'a/001.sql': 'ALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n',
+    'z/001.sql': 'ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;\n',
+  });
+  const r4 = await scanStatic(dir4);
+  check('F01: an external table toggled in two different directories is not a confident clean pass', () => {
+    const f = r4.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `got ${ids(r4)}`);
+    assert.strictEqual(summarize(r4.findings, r4.runs).gate, 'warn');
+  });
+  rmSync(dir4, { recursive: true, force: true });
+
+  // The exact reported repro: a clean, known table must not silence an
+  // external table's DISABLE sitting in the very same file.
+  const dir5 = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'CREATE TABLE public.notes(id uuid);\nALTER TABLE public.notes ENABLE ROW LEVEL SECURITY;\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n',
+  });
+  const r5 = await scanStatic(dir5);
+  check('F01: a clean known table does not mask an external DISABLE in the same file', () => {
+    const f = r5.findings.find((x) => x.id === 'rls_missing');
+    assert.ok(f, `got ${JSON.stringify(r5.findings.map((f2) => f2.title))}`);
+    assert.match(f.title, /orders.*never created in this repo/);
+    assert.strictEqual(summarize(r5.findings, r5.runs).gate, 'warn');
+  });
+  rmSync(dir5, { recursive: true, force: true });
+}
+
+// F02 (0.6.7): walk() skipped .mts, .cts, .jsonc and .json5 entirely — the
+// lexer (code-lex.ts) already had a profile for all four, but the file never
+// reached the scanner because TEXT_EXT didn't list the extensions.
+{
+  const dir = fixture({
+    'config.mts': `export const OPENAI_KEY = "${K}";\n`,
+    'settings.jsonc': `{\n  // secret key\n  "apiKey": "${K}"\n}\n`,
+  });
+  const r = await scanStatic(dir);
+  check('F02: a TypeScript ESM (.mts) file is scanned for secrets', () => {
+    const f = r.findings.find((x) => x.id === 'openai_key' && x.file === 'config.mts');
+    assert.ok(f, `got ${JSON.stringify(r.findings.map((f2) => [f2.id, f2.file]))}`);
+  });
+  check('F02: a JSON-with-comments (.jsonc) file is scanned for secrets', () => {
+    const f = r.findings.find((x) => x.id === 'openai_key' && x.file === 'settings.jsonc');
+    assert.ok(f, `got ${JSON.stringify(r.findings.map((f2) => [f2.id, f2.file]))}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  const dir = fixture({
+    'util.cts': `module.exports.OPENAI_KEY = "${K}";\n`,
+    'settings.json5': `{\n  apiKey: "${K}",\n}\n`,
+  });
+  const r = await scanStatic(dir);
+  check('F02: a TypeScript CommonJS (.cts) file is scanned for secrets', () => {
+    const f = r.findings.find((x) => x.id === 'openai_key' && x.file === 'util.cts');
+    assert.ok(f, `got ${JSON.stringify(r.findings.map((f2) => [f2.id, f2.file]))}`);
+  });
+  check('F02: a JSON5 (.json5) file is scanned for secrets', () => {
+    const f = r.findings.find((x) => x.id === 'openai_key' && x.file === 'settings.json5');
+    assert.ok(f, `got ${JSON.stringify(r.findings.map((f2) => [f2.id, f2.file]))}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Negative: an extension that is genuinely not text-scannable (a binary
+  // blob) stays skipped — the fix must not turn walk() into "scan everything."
+  const dir = fixture({ 'photo.jsonc.bak': 'not scanned, wrong extension' });
+  const r = await scanStatic(dir);
+  check('negative: an extension outside the walk allowlist is still skipped', () => {
+    assert.ok(!ids(r).includes('openai_key'));
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// F03 (0.6.7): INLINE_ENV was disabled for config-ish files (YAML, Dockerfile,
+// docker-compose), leaving ASSIGN — a start-of-line, one-per-line regex — as
+// the only detector there. It cannot see a secret mid-line: a Compose
+// `environment:` list item, a CI `run:` step, or a second KEY=VALUE on the
+// same Dockerfile ENV line. INLINE_ENV now runs everywhere, after ASSIGN.
+const SECRET_VAL = 'Q7vB2mN9xK4rT8wY3pL6cD1hF5jA0eS2gU3iO9xN';
+{
+  const dir = fixture({
+    'docker-compose.yml': `services:\n  app:\n    image: node:20\n    environment:\n      - API_TOKEN=${SECRET_VAL}\n`,
+  });
+  const r = await scanStatic(dir);
+  check('F03: a secret in a Compose `environment:` YAML list item is found', () => {
+    const f = r.findings.find((x) => x.id === 'env_secret' && x.file === 'docker-compose.yml');
+    assert.ok(f, `got ${JSON.stringify(r.findings.map((f2) => [f2.id, f2.file]))}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  const dir = fixture({
+    '.github/workflows/ci.yml': `name: CI\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: TOKEN=${SECRET_VAL} ./deploy.sh\n`,
+  });
+  const r = await scanStatic(dir);
+  check('F03: a secret inline in a GitHub Actions `run:` step is found', () => {
+    const f = r.findings.find((x) => x.id === 'env_secret' && x.file === '.github/workflows/ci.yml');
+    assert.ok(f, `got ${JSON.stringify(r.findings.map((f2) => [f2.id, f2.file]))}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  const dir = fixture({ Dockerfile: `FROM node:20\nENV NODE_ENV=production API_TOKEN=${SECRET_VAL}\n` });
+  const r = await scanStatic(dir);
+  check('F03: the second KEY=VALUE on a multi-variable Dockerfile ENV line is found', () => {
+    const f = r.findings.find((x) => x.id === 'env_secret' && x.file === 'Dockerfile');
+    assert.ok(f, `got ${JSON.stringify(r.findings.map((f2) => [f2.id, f2.file]))}`);
+    assert.match(f.detail, /API_TOKEN/);
+  });
+  check('negative: a non-secret-named var on the same line (NODE_ENV) is not flagged by itself', () => {
+    const fs = r.findings.filter((x) => x.id === 'env_secret' && x.file === 'Dockerfile');
+    assert.ok(!fs.some((f) => /NODE_ENV/.test(f.detail) && !/API_TOKEN/.test(f.detail)));
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Negative: a plain single-assignment config/env line keeps ASSIGN's more
+  // specific title/fix — INLINE_ENV firing on the same line must not
+  // downgrade it to the generic "inline assignment" message.
+  const dir = fixture({
+    '.env': `API_TOKEN=${SECRET_VAL}\n`,
+    'config.yml': `api_token: ${SECRET_VAL}\n`,
+  });
+  const r = await scanStatic(dir);
+  check('negative: a plain .env assignment still reads as "Secret in env file", not "inline assignment"', () => {
+    const fs = r.findings.filter((x) => x.file === '.env' && x.id === 'env_secret');
+    assert.strictEqual(fs.length, 1, `got ${JSON.stringify(fs)}`);
+    assert.strictEqual(fs[0].title, 'Secret in env file');
+  });
+  check('negative: a plain YAML key: value assignment still reads as "Secret in config file"', () => {
+    const fs = r.findings.filter((x) => x.file === 'config.yml' && x.id === 'env_secret');
+    assert.strictEqual(fs.length, 1, `got ${JSON.stringify(fs)}`);
+    assert.strictEqual(fs[0].title, 'Secret in config file');
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// F04 (0.6.7): NON_SECRET_NAME's "session" and "reset" terms blanket-excluded
+// real credentials — sessionSecret (the express-session/cookie-session
+// signing key), sessionToken and resetToken (bearer/account-recovery tokens)
+// — from generic_secret detection, alongside genuinely non-secret ids like
+// trackingToken.
+{
+  const dir = fixture({
+    'config.js': [
+      `const sessionSecret = "${SECRET_VAL}";`,
+      `const sessionToken = "${SECRET_VAL}";`,
+      `const resetToken = "${SECRET_VAL}";`,
+      `const trackingToken = "${SECRET_VAL}";`,
+      '',
+    ].join('\n'),
+  });
+  const r = await scanStatic(dir);
+  check('F04: a hardcoded sessionSecret is flagged as a possible secret', () => {
+    const f = r.findings.find((x) => x.id === 'generic_secret' && x.line === 1);
+    assert.ok(f, `got ${JSON.stringify(r.findings)}`);
+  });
+  check('F04: a hardcoded sessionToken is flagged as a possible secret', () => {
+    const f = r.findings.find((x) => x.id === 'generic_secret' && x.line === 2);
+    assert.ok(f, `got ${JSON.stringify(r.findings)}`);
+  });
+  check('F04: a hardcoded resetToken is flagged as a possible secret', () => {
+    const f = r.findings.find((x) => x.id === 'generic_secret' && x.line === 3);
+    assert.ok(f, `got ${JSON.stringify(r.findings)}`);
+  });
+  check('negative: trackingToken (an opaque API cursor, not a credential) stays excluded', () => {
+    const f = r.findings.find((x) => x.id === 'generic_secret' && x.line === 4);
+    assert.ok(!f, `got ${JSON.stringify(r.findings)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// F05 (0.6.7): a "well-known default" password (e.g. "password") was exempt
+// from db_url_password UNCONDITIONALLY, not just on a local/dev host — so the
+// exact same weak password on a real remote host read as clean.
+{
+  const dir = fixture({ 'config.js': 'const DB_URL = "postgres://alice:password@db.audit.invalid/prod";\n' });
+  const r = await scanStatic(dir);
+  check('F05: a well-known-default password on a real remote host is still flagged', () => {
+    assert.ok(ids(r).includes('db_url_password'), `got ${ids(r)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Negative: the original local/dev-container intent is unchanged — a
+  // compose service's throwaway default login on a local host stays quiet.
+  const dir = fixture({ 'docker-compose.yml': 'services:\n  db:\n    image: postgres\n    environment:\n      DATABASE_URL: "postgres://opencut:opencut@localhost:5432/app"\n' });
+  const r = await scanStatic(dir);
+  check('negative: a default password on localhost stays exempt', () => {
+    assert.ok(!ids(r).includes('db_url_password'), `got ${ids(r)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Found while re-dogfooding the F05 fix: a markdown-style example URL in a
+  // comment/docstring (`` `postgres://user:pass@localhost` ``) swallowed the
+  // closing backtick into the host, so "localhost`" no longer matched
+  // `^localhost$` and the local-host exemption silently stopped applying.
+  const dir = fixture({
+    'notes.js': '// Example: `postgres://opencut:opencut@localhost` is a throwaway dev login.\n',
+  });
+  const r = await scanStatic(dir);
+  check('negative: an example DB URL inside a backtick-quoted comment still reads as local, not a leak', () => {
+    assert.ok(!ids(r).includes('db_url_password'), `got ${ids(r)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// F06 (0.6.7): dedup was keyed on file:line alone for a vendor-specific vs.
+// name-based finding pair, so a specific match (openai_key) on a line
+// silently deleted a DIFFERENT secret's name-based finding (generic_secret)
+// on that same line, rather than only deleting a name-based finding for the
+// SAME value the specific rule already reported.
+{
+  const dir = fixture({
+    'config.js': `const key = "sk-proj-${SECRET_VAL}", password = "Zx9Km2Lp8Qr3Wv7Ty1Nb4Hs6Fd0Jc";\n`,
+  });
+  const r = await scanStatic(dir);
+  check('F06: a second, distinct secret co-located on the same line as a vendor-pattern hit is still reported', () => {
+    assert.ok(ids(r).includes('openai_key'), `got ${ids(r)}`);
+    assert.ok(ids(r).includes('generic_secret'), `got ${ids(r)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Negative: the SAME secret matched by both a vendor pattern and a
+  // name-based rule must still collapse to one finding, not two.
+  const dir = fixture({ 'config.js': `const openaiApiKey = "sk-proj-${SECRET_VAL}";\n` });
+  const r = await scanStatic(dir);
+  check('negative: the same secret caught by two rules on one line still dedupes to one finding', () => {
+    const hits = r.findings.filter((f) => f.id === 'openai_key' || f.id === 'generic_secret');
+    assert.strictEqual(hits.length, 1, `got ${JSON.stringify(hits)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// F07 (0.6.7): client-exposure's PUBLIC_ASSIGN regex required the var name to
+// be followed straight by `:`/`=`, so a quoted object-literal key (a real,
+// common shape for config/JSON) never matched at all; and it scanned raw
+// content, so commented-out code read as a live browser exposure.
+{
+  const dir = fixture({
+    'config.js': `export const config = {\n  "NEXT_PUBLIC_STRIPE_SECRET": "sk_live_${SECRET_VAL}",\n};\n`,
+  });
+  const r = await scanStatic(dir);
+  check('F07: a quoted object-literal property name is still recognized as a public-prefixed assignment', () => {
+    const f = r.findings.find((x) => x.id === 'public_env_secret' && x.file === 'config.js');
+    assert.ok(f, `got ${JSON.stringify(r.findings.map((f2) => [f2.id, f2.file, f2.line]))}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  const dir = fixture({
+    'commented.js': `// const NEXT_PUBLIC_STRIPE_SECRET = "sk_live_${SECRET_VAL}";\nfunction real() { return 1; }\n`,
+  });
+  const r = await scanStatic(dir);
+  check('negative: a public-prefixed secret inside a comment is not a live browser exposure', () => {
+    assert.ok(!r.findings.some((x) => x.id === 'public_env_secret' && x.file === 'commented.js'), `got ${JSON.stringify(r.findings)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Found while re-running the ground-truth check after the F07 comment-mask
+  // fix: masking a `#` comment to blank space let the value gap after an
+  // EMPTY-valued var (a common .env.example shape: `KEY=\n\n# comment\n`)
+  // skip straight past the blank/commented lines onto the NEXT var's own
+  // name, reporting that name as a leaked "secret" value.
+  const dir = fixture({
+    '.env.example': [
+      'NEXT_PUBLIC_REPLICATE_API_TOKEN=',
+      '',
+      '# Seedance 2.0 (ByteDance) via PiAPI',
+      '# Get your key at https://piapi.ai',
+      'NEXT_PUBLIC_SEEDANCE_API_KEY=',
+      '',
+    ].join('\n'),
+  });
+  const r = await scanStatic(dir);
+  check('negative: an empty public var before a comment does not swallow the next var name as its value', () => {
+    assert.ok(!ids(r).includes('public_env_secret'), `got ${JSON.stringify(r.findings)}`);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// F08 (0.6.7): SQL-interpolation detection lost string-VALUE injections in two
+// ways — the quoted-value shape (`name = '${x}'`) read as structural (info,
+// not a warning) because VALUE_POSITION required the operator right before
+// the hole with no SQL-literal quote in between, and a Python f-string using
+// the OTHER quote character for its SQL value (`f"… = '{x}'"`) never matched
+// the detection regex at all, since it excluded both quote characters.
+{
+  const dir = fixture({
+    'db.js': "db.query(`UPDATE users SET name = '${name}', email = '${email}' WHERE id = '${id}'`);\n",
+  });
+  const r = await scanStatic(dir);
+  check('F08: a quoted SQL string VALUE interpolation stays a warning, not downgraded to info', () => {
+    const f = r.findings.find((x) => x.id === 'sql_interpolation' && x.file === 'db.js');
+    assert.ok(f, `got ${JSON.stringify(r.findings)}`);
+    assert.strictEqual(f.severity, 'warning', JSON.stringify(f));
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  const dir = fixture({ 'db.py': `q = f"SELECT * FROM users WHERE name = '{pattern}'"\n` });
+  const r = await scanStatic(dir);
+  check('F08: a Python f-string SQL query with a nested-quote VALUE is detected at all', () => {
+    const f = r.findings.find((x) => x.id === 'sql_interpolation' && x.file === 'db.py');
+    assert.ok(f, `got ${JSON.stringify(r.findings)}`);
+    assert.strictEqual(f.severity, 'warning', JSON.stringify(f));
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Negative: a purely structural splice (column/table names, values still
+  // parameterized) must still read as info, not be over-corrected to warning.
+  const dir = fixture({ 'db.ts': 'db.prepare(`UPDATE clients SET ${set} WHERE id = ?`);\n' });
+  const r = await scanStatic(dir);
+  check('negative: a structural-only splice with parameterized values stays info', () => {
+    const f = r.findings.find((x) => x.id === 'sql_interpolation' && x.file === 'db.ts');
+    assert.ok(f, `got ${JSON.stringify(r.findings)}`);
+    assert.strictEqual(f.severity, 'info', JSON.stringify(f));
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// F09 (0.6.7): the CLI unconditionally excluded --output from the scan, even
+// when --no-report (format 'none') means nothing is ever written there. A
+// real project laid out with --output pointed at its own source (or any
+// directory that happens to share a name/path with it) had that source
+// silently dropped from the scan while producing zero report files.
+{
+  const dir = fixture({ 'src/config.js': `const OPENAI_KEY = "${K}";\n` });
+  const p = runCli([dir, '--no-wizard', '--no-report', '--output', join(dir, 'src'), '--lang', 'en']);
+  check('F09: --no-report --output <project>/src still scans the real source in src/', () => {
+    assert.match(p.stdout, /OpenAI API key/, p.stdout);
+    assert.match(p.stdout, /src[\\/]config\.js/, p.stdout);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Same guarantee via an explicit --format none (not just --no-report) —
+  // the fix is keyed on "will a report be written", not on the flag name.
+  const dir = fixture({ 'src/config.js': `const OPENAI_KEY = "${K}";\n` });
+  const p = runCli([dir, '--no-wizard', '--format', 'none', '--output', join(dir, 'src'), '--lang', 'en']);
+  check('F09: --format none --output <project>/src also still scans src/', () => {
+    assert.match(p.stdout, /OpenAI API key/, p.stdout);
+  });
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // Negative: when a report WILL actually be written, the output directory
+  // must still be excluded from the scan, exactly as before this fix.
+  const dir = fixture({ 'config.js': `const OPENAI_KEY = "${K}";\n` });
+  const out = join(dir, 'reports');
+  mkdirSync(out, { recursive: true });
+  const p = runCli([dir, '--no-wizard', '--format', 'json', '--output', out, '--lang', 'en']);
+  check('negative: with a real report requested, --output stays excluded from the scan', () => {
+    assert.ok(existsSync(join(out, 'report.json')), p.stdout + p.stderr);
+    const report = JSON.parse(readFileSync(join(out, 'report.json'), 'utf8'));
+    assert.ok(!report.findings.some((f) => f.file && f.file.startsWith('reports/')), JSON.stringify(report.findings));
+  });
+  rmSync(dir, { recursive: true, force: true });
 }

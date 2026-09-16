@@ -148,22 +148,28 @@ const PATTERNS: Pattern[] = [
   {
     id: 'db_url_password',
     title: 'Database URL with an inline password',
-    re: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|mssql):\/\/[^\s:/@"']+:([^\s:/@"']{4,})@[^\s"']+/gi,
+    // The trailing char classes exclude backtick/paren/bracket/comma/semicolon
+    // as well as the usual quote+whitespace: a URL written as a markdown-style
+    // example (`` `postgres://user:pass@host` `` in a comment or docstring)
+    // otherwise swallows the closing backtick into the host, which broke the
+    // local-host check below (`localhost\`` never matches `^localhost$`).
+    re: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|mssql):\/\/[^\s:/@"'`)\];,]+:([^\s:/@"'`)\];,]{4,})@[^\s"'`)\];,]+/gi,
     severity: 'critical',
     fix: 'Move the connection string to a server-side env var and rotate the database password — a committed DB URL grants full data access.',
     // `postgres://opencut:opencut@localhost` in docker-compose / CI / a Dockerfile
     // is a local container's default login, not a credential. A password that
-    // equals the user name, or is a well-known default, is never reported; a
-    // weak password on a local/single-label host (a compose service name) is
-    // not either. A real-looking password on a real host still is.
+    // equals the user name, or is a well-known default, or is otherwise weak,
+    // is only exempt on a local/single-label host (a compose service name) —
+    // the exact same password on a real remote host is a live, guessable
+    // credential, not a throwaway dev default, and must still be reported.
     validate: (hit) => {
-      const m = /^[a-z+]+:\/\/([^\s:/@"']+):([^\s:/@"']+)@([^/\s:"']+)/i.exec(hit);
+      const m = /^[a-z+]+:\/\/([^\s:/@"'`)\];,]+):([^\s:/@"'`)\];,]+)@([^/\s:"'`)\];,]+)/i.exec(hit);
       if (!m) return true;
       const [, user = '', pw = '', host = ''] = m;
-      if (pw.toLowerCase() === user.toLowerCase() || DEFAULT_PASSWORDS.has(pw.toLowerCase())) return false;
       const local = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|host\.docker\.internal|[a-z0-9_-]+)$/i.test(host);
       const strong = /[0-9]/.test(pw) && /[A-Za-z]/.test(pw) && shannonEntropy(pw) >= 3.0;
-      return !(local && !strong);
+      const weak = pw.toLowerCase() === user.toLowerCase() || DEFAULT_PASSWORDS.has(pw.toLowerCase()) || !strong;
+      return !(local && weak);
     },
   },
   {
@@ -188,8 +194,14 @@ const GENERIC = /\b([A-Za-z0-9_-]*(?:api[_-]?key|secret|token|passwd|password|pw
  * tracking ids, CSRF nonces, push tokens. 559 of 569 generic hits in one real
  * project were `tracking_token` / `pagination_token` inside cached API
  * responses.
+ *
+ * Deliberately NOT here: "session" and "reset". `sessionSecret` (the signing
+ * key for express-session/cookie-session — a real, common config secret) and
+ * `sessionToken`/`resetToken` (bearer auth / password-reset tokens, both
+ * enough to take over an account) are genuine credentials, not opaque ids —
+ * unlike `trackingToken`/`paginationToken`, they were being excluded outright.
  */
-const NON_SECRET_NAME = /(pagination|tracking|page|next|prev|continuation|cursor|csrf|xsrf|cancel|request|device|push|fcm|expo|invite|share|verification|unsubscribe|reset|confirm|session)/i;
+const NON_SECRET_NAME = /(pagination|tracking|page|next|prev|continuation|cursor|csrf|xsrf|cancel|request|device|push|fcm|expo|invite|share|verification|unsubscribe|confirm)/i;
 /** Base64 blobs (thumbnails, binary) and anything longer than a real token. */
 const looksLikeBlob = (v: string) => v.length > 200 || /^(\/9j\/|iVBOR|data:|R0lGOD|UklGR)/.test(v);
 
@@ -405,31 +417,9 @@ export const secretsChecker: Checker = {
         }, false, value);
       }
 
-      // Inline shell-style assignments mid-line, outside env/config files (those
-      // go through ASSIGN below). A prod DB password inside a permission rule in
-      // .claude/settings.local.json was invisible to both other name-based rules.
-      if (!isConfigish(rel)) {
-        for (const m of content.matchAll(INLINE_ENV)) {
-          const name = m[1] ?? '';
-          const value = m[2] ?? '';
-          if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
-          if (!/[0-9]/.test(value) && value.length < 24) continue;
-          push({
-            id: 'env_secret',
-            severity: 'warning',
-            title: 'Secret in an inline assignment',
-            detail: `"${name}" is assigned a high-entropy value inline in ${rel}: ${redact(value)}`,
-            fix: 'Move the value to a gitignored .env and reference it by name; rotate it if the file was ever shared.',
-            checker: 'secrets',
-            level: 0,
-            file: rel,
-            line: lineAt(content, m.index ?? 0),
-            evidence: redact(value),
-          }, false, value);
-        }
-      }
-
       // name=value / key: value assignments (env, config, Dockerfile ENV/ARG).
+      // Runs first so a plain, single-assignment line keeps this rule's more
+      // specific title/fix on the dedup tie below, rather than INLINE_ENV's.
       if (isConfigish(rel)) {
         for (const m of content.matchAll(ASSIGN)) {
           const name = m[1] ?? '';
@@ -454,6 +444,33 @@ export const secretsChecker: Checker = {
           }, false, value);
         }
       }
+
+      // Inline shell-style assignments mid-line, in every file including
+      // config-ish ones. ASSIGN above is start-of-line and one-per-line, so it
+      // never sees a Compose `environment:` list item (`- TOKEN=…`), a CI
+      // step's inline `run: TOKEN=… cmd`, or a second KEY=VALUE later on the
+      // same Dockerfile ENV line — all real leaks it silently missed while
+      // this ran only for non-config files. Also still needed for the
+      // original case: a prod DB password inside a permission rule in
+      // .claude/settings.local.json, invisible to every other name-based rule.
+      for (const m of content.matchAll(INLINE_ENV)) {
+        const name = m[1] ?? '';
+        const value = m[2] ?? '';
+        if (looksLikePlaceholder(value) || shannonEntropy(value) < 3.0) continue;
+        if (!/[0-9]/.test(value) && value.length < 24) continue;
+        push({
+          id: 'env_secret',
+          severity: 'warning',
+          title: 'Secret in an inline assignment',
+          detail: `"${name}" is assigned a high-entropy value inline in ${rel}: ${redact(value)}`,
+          fix: 'Move the value to a gitignored .env and reference it by name; rotate it if the file was ever shared.',
+          checker: 'secrets',
+          level: 0,
+          file: rel,
+          line: lineAt(content, m.index ?? 0),
+          evidence: redact(value),
+        }, false, value);
+      }
     }
 
     // De-duplicate only true repeats: the same secret, same place, same rule.
@@ -464,11 +481,15 @@ export const secretsChecker: Checker = {
       const cur = seen.get(key);
       if (!cur || SEVERITY_RANK[f.severity] < SEVERITY_RANK[cur.severity]) seen.set(key, f);
     }
-    // A vendor pattern or a decoded JWT already identifies the value on a line;
-    // the name-based env_secret / generic_secret there is the same fact twice.
+    // A vendor pattern or a decoded JWT already identifies a VALUE on a line;
+    // the name-based env_secret / generic_secret finding for that SAME value
+    // is the same fact twice. Keyed on file:line:evidence, not just
+    // file:line — two different secrets assigned on one line (`const
+    // key="sk-proj-…", password="…"`) are two different facts, and dropping
+    // the second because the first has a specific pattern hid it entirely.
     const NAME_BASED = new Set(['env_secret', 'generic_secret']);
-    const specificAt = new Set([...seen.values()].filter((f) => !NAME_BASED.has(f.id)).map((f) => `${f.file ?? ''}:${f.line ?? 0}`));
-    const kept = [...seen.values()].filter((f) => !(NAME_BASED.has(f.id) && specificAt.has(`${f.file ?? ''}:${f.line ?? 0}`)));
+    const specificAt = new Set([...seen.values()].filter((f) => !NAME_BASED.has(f.id)).map((f) => `${f.file ?? ''}:${f.line ?? 0}:${f.evidence ?? ''}`));
+    const kept = [...seen.values()].filter((f) => !(NAME_BASED.has(f.id) && specificAt.has(`${f.file ?? ''}:${f.line ?? 0}:${f.evidence ?? ''}`)));
 
     // Eleven advisories saying "secret in gitignored .env.local — fine" are one
     // observation printed eleven times. Fold them into one line per file that

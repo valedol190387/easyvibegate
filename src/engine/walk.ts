@@ -41,9 +41,9 @@ const isShallowDataDir = (name: string, relDir: string): boolean => {
 };
 
 const TEXT_EXT = new Set([
-  '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.vue', '.svelte',
+  '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts', '.vue', '.svelte',
   '.py', '.rb', '.php', '.go', '.rs', '.java', '.kt', '.cs',
-  '.html', '.css', '.scss', '.json', '.yml', '.yaml', '.toml',
+  '.html', '.css', '.scss', '.json', '.jsonc', '.json5', '.yml', '.yaml', '.toml',
   '.env', '.sh', '.sql', '.md', '.txt', '.ini', '.conf', '.tf',
   '.pem', '.key', '.crt', '.cert', '.pkcs8',
   '.astro', '.properties', '.plist', '.swift', '.dart', '.ipynb', '.bash', '.zsh', '.mdx',

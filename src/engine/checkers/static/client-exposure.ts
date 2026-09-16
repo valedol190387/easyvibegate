@@ -1,13 +1,23 @@
 import type { Checker, Finding } from '../../types.js';
 import { lineAt, looksLikePlaceholder, redact } from '../../util/text.js';
+import { maskCode } from '../../util/mask.js';
 import { classifyKey } from '../backend/supabase.js';
 
 // Public env prefixes are inlined into the browser bundle by the bundler.
 const PUBLIC_PREFIX = '(?:NEXT_PUBLIC_|VITE_|REACT_APP_|EXPO_PUBLIC_|GATSBY_|PUBLIC_)';
 
 // Every public-prefixed assignment; what it carries is decided by the VALUE
-// first and the NAME second (below).
-const PUBLIC_ASSIGN = new RegExp(`\\b(${PUBLIC_PREFIX}[A-Z0-9_]*)\\s*[:=]\\s*["']?([^"'\\s]{6,})`, 'gi');
+// first and the NAME second (below). The name gets an optional closing quote
+// before the `:`/`=` — a JSON/object literal's `"NEXT_PUBLIC_KEY": "value"`
+// otherwise never matched at all, since nothing after the bare name expected
+// that stray `"`. The gap between `:`/`=` and the value is same-line
+// whitespace only (`[ \t]*`, not `\s*`) — an EMPTY-valued var followed by
+// blank/commented lines otherwise let the value group skip straight past
+// them onto the NEXT var's name, reporting that name as a leaked secret
+// value. Once comments started getting masked to blank space (below), a
+// `.env.example`'s usual "KEY=\n\n# comment\nNEXT_KEY=" shape hit this on
+// real projects.
+const PUBLIC_ASSIGN = new RegExp(`\\b(${PUBLIC_PREFIX}[A-Z0-9_]*)["']?\\s*[:=][ \\t]*["']?([^"'\\s]{6,})`, 'gi');
 
 // A public var whose NAME implies a real secret (not an anon/publishable key).
 const SECRET_NAME = /(SERVICE_ROLE|SECRET|PRIVATE|PASSWORD|PASSWD|TOKEN|CREDENTIAL|API_KEY|ACCESS_KEY)/i;
@@ -46,8 +56,11 @@ export const clientExposureChecker: Checker = {
 
     for (const file of ctx.files) {
       const { content, rel } = file;
+      // Commented-out code is not a live exposure; masking preserves length
+      // and newlines so match offsets/line numbers still point at the source.
+      const scan = maskCode(content, { file: rel });
 
-      for (const m of content.matchAll(PUBLIC_ASSIGN)) {
+      for (const m of scan.matchAll(PUBLIC_ASSIGN)) {
         const name = m[1] ?? '';
         const value = m[2] ?? '';
         if (looksLikePlaceholder(value)) continue;

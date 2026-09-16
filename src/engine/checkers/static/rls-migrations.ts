@@ -657,22 +657,36 @@ export const rlsMigrationsChecker: Checker = {
     events.sort((a, b) => a.fileIdx - b.fileIdx || a.offset - b.offset);
 
     /** `keys`: every key this table has lived under, so a rename does not hide earlier statements. */
-    interface State { created: boolean; enabled: boolean; file: string; line: number; display: string; stateFile: string; guarded: boolean; keys: Set<string> }
+    // `everCreated` is separate from `created`: DROP clears `created` (the
+    // table is gone NOW) but must not erase the fact that it once existed
+    // HERE — that fact is what tells a legitimately dropped table apart from
+    // one that was never created in this repo at all (an external table,
+    // managed from the dashboard or a migration outside this scan). Once set,
+    // `everCreated` is never cleared, including across a RENAME: the spread
+    // `{...cur, ...}` below carries it (and `keys`, `guarded`, `enabled`) to
+    // whatever name the table currently answers to.
+    interface State {
+      created: boolean; everCreated: boolean; enabled: boolean; file: string; line: number;
+      display: string; stateFile: string; stateLine: number; guarded: boolean; keys: Set<string>;
+    }
     const state = new Map<string, State>();
     for (const e of events) {
-      const cur = state.get(e.key) ?? { created: false, enabled: false, file: e.file, line: e.line, display: e.display, stateFile: e.file, guarded: false, keys: new Set([e.key]) };
+      const cur = state.get(e.key) ?? {
+        created: false, everCreated: false, enabled: false, file: e.file, line: e.line,
+        display: e.display, stateFile: e.file, stateLine: e.line, guarded: false, keys: new Set([e.key]),
+      };
       if (e.kind === 'rename') {
         const to = e.toKey as string;
         cur.keys.add(to);
         if (e.conditional) {
           // Which name the table ends up under is unknown: keep it under both, both in doubt.
-          cur.guarded = true; cur.stateFile = e.file;
+          cur.guarded = true; cur.stateFile = e.file; cur.stateLine = e.line;
           state.set(e.key, cur);
           if (!state.has(to)) state.set(to, { ...cur, keys: new Set(cur.keys), display: e.toDisplay ?? cur.display });
           continue;
         }
         state.delete(e.key);
-        state.set(to, { ...cur, display: e.toDisplay ?? cur.display, stateFile: e.file });
+        state.set(to, { ...cur, display: e.toDisplay ?? cur.display, stateFile: e.file, stateLine: e.line });
         continue;
       }
       // Doubt is a property of ANY guarded statement, not just a guarded ENABLE.
@@ -682,23 +696,23 @@ export const rlsMigrationsChecker: Checker = {
       if (e.conditional) {
         // Keep the table in the model: assume the guarded branch did NOT run
         // (the outcome that leaves data exposed), and record the uncertainty.
-        if (e.kind === 'create' && !cur.created) { cur.created = true; cur.enabled = false; cur.file = e.file; cur.line = e.line; cur.display = e.display; }
+        if (e.kind === 'create' && !cur.created) { cur.created = true; cur.everCreated = true; cur.enabled = false; cur.file = e.file; cur.line = e.line; cur.display = e.display; }
         if (e.kind === 'enable') cur.enabled = true;
         if (e.kind === 'disable') cur.enabled = false;
         cur.guarded = true;
-        cur.stateFile = e.file;
+        cur.stateFile = e.file; cur.stateLine = e.line;
         state.set(e.key, cur);
         continue;
       }
       switch (e.kind) {
         case 'create':
           if (e.ifNotExists && cur.created) break; // existing table: no-op, keep RLS state
-          cur.created = true; cur.enabled = false; cur.file = e.file; cur.line = e.line; cur.display = e.display;
-          cur.stateFile = e.file; cur.guarded = false;
+          cur.created = true; cur.everCreated = true; cur.enabled = false; cur.file = e.file; cur.line = e.line; cur.display = e.display;
+          cur.stateFile = e.file; cur.stateLine = e.line; cur.guarded = false;
           break;
-        case 'enable': cur.enabled = true; cur.stateFile = e.file; cur.guarded = false; break;
-        case 'disable': cur.enabled = false; cur.stateFile = e.file; cur.guarded = false; break;
-        case 'drop': cur.created = false; cur.enabled = false; cur.stateFile = e.file; cur.guarded = false; break;
+        case 'enable': cur.enabled = true; cur.stateFile = e.file; cur.stateLine = e.line; cur.guarded = false; break;
+        case 'disable': cur.enabled = false; cur.stateFile = e.file; cur.stateLine = e.line; cur.guarded = false; break;
+        case 'drop': cur.created = false; cur.enabled = false; cur.stateFile = e.file; cur.stateLine = e.line; cur.guarded = false; break;
       }
       state.set(e.key, cur);
     }
@@ -716,79 +730,68 @@ export const rlsMigrationsChecker: Checker = {
 
     const findings: Finding[] = [];
     for (const [key, s] of state) {
-      if (!s.created || isTempKey(key)) continue; // temp tables are session-only: PostgREST never sees them
+      if (isTempKey(key)) continue; // temp tables are session-only: PostgREST never sees them
+      if (s.everCreated && !s.created) continue; // created here, then legitimately DROPped: known, gone, not a problem
+      // Reaching here means one of two things: `s.created` (created here and
+      // still exists — the original, well-tested case), or `!s.everCreated`
+      // (this key is only ever the target of ALTER/RENAME — an EXTERNAL
+      // table this repo never creates, managed from the dashboard or a
+      // migration outside this scan). Both get the SAME ambiguity/guard
+      // evaluation below: a DISABLE right there in the scanned file is not
+      // "no information" just because we cannot confirm the table exists,
+      // and an unconditional ENABLE on either is equally provably safe.
+      // Reusing one model — instead of a second, separate one for external
+      // tables that has to relearn DROP/RENAME/guard/cross-directory order
+      // on its own — is what keeps them from disagreeing with each other.
+      const external = !s.everCreated;
       const ambiguous = events.some(
         (e) => s.keys.has(e.key) && dirOf(e.file) !== dirOf(s.stateFile) && (s.enabled ? turnsOff(e.kind) : e.kind === 'enable'),
       );
-      if (s.enabled && !ambiguous && !s.guarded) continue; // provably protected
+      if (s.enabled && !ambiguous && !s.guarded) continue; // provably protected (or provably fine, if external)
       // `guarded` means a statement we had to GUESS about decided this table's
       // state — a conditional ENABLE, DISABLE, CREATE, DROP or RENAME. Calling
       // that "critical" would be the same false confidence as calling it clean,
       // so it is reported as unconfirmed. A warning still fails CI (exit 1); it
       // just does not claim to know what only the database can tell.
-      const kind = ambiguous ? 'order' : s.guarded ? 'guarded' : 'missing';
+      const kind = external ? 'external' : ambiguous ? 'order' : s.guarded ? 'guarded' : 'missing';
       findings.push({
         id: 'rls_missing',
         severity: kind === 'missing' ? missingSeverity : 'warning',
         title:
-          kind === 'missing'
-            ? (missingSeverity === 'critical'
-              ? `Table "${s.display}" created without RLS`
-              : `Table "${s.display}" has no RLS (server-only database)`)
-            : kind === 'order' ? `Table "${s.display}" may end up without RLS (migration order unclear)`
-              : `Table "${s.display}" has an unconfirmed RLS state (conditional block)`,
+          kind === 'external' ? `Table "${s.display}" may have RLS disabled here, but is never created in this repo`
+            : kind === 'missing'
+              ? (missingSeverity === 'critical'
+                ? `Table "${s.display}" created without RLS`
+                : `Table "${s.display}" has no RLS (server-only database)`)
+              : kind === 'order' ? `Table "${s.display}" may end up without RLS (migration order unclear)`
+                : `Table "${s.display}" has an unconfirmed RLS state (conditional block)`,
         detail:
-          kind === 'missing'
-            ? (missingSeverity === 'critical'
-              ? `"${s.display}" is created in a migration and its latest state does not enable Row Level Security. On Supabase the anon role has full table privileges by default, so with RLS off the public key can READ, INSERT, UPDATE and DELETE every row through the REST API. Static view only: this covers tables created by migrations in this repository — tables created from the dashboard or elsewhere are not listed here; the live probe enumerates all of them.`
-              : `"${s.display}" is created without Row Level Security. Only server code (pg/Prisma/…) appears to talk to this database, so nothing hands its rows to clients directly — that is normal, not a hole. It becomes CRITICAL the moment a client-facing data API (Supabase/PostgREST anon key, Hasura) is put in front of the same database.`)
-            : kind === 'order'
-              ? `"${s.display}" has statements in directories other than "${s.stateFile}" that contradict its final RLS state. Files in separate directories have no reliable apply order, so this cannot be decided statically — check the deployed state.`
-              : `"${s.display}" has a table or RLS statement whose execution cannot be confirmed statically: inside an IF/LOOP branch or a block with an EXCEPTION handler, after a RETURN, in a rolled-back or unterminated transaction, or on a name a TEMP table may shadow. Whether it took effect cannot be decided without running the migration, so its RLS state is NOT confirmed — check the deployed state.`,
+          kind === 'external'
+            ? `"${s.display}" is not created by any migration this scan can see, but this project's SQL leaves it with Row Level Security off — or its state cannot be confirmed statically (a conditional branch, or statements in different directories with no reliable apply order). Either the table is real — created from the dashboard, or in a migration outside this repo — and RLS on it may now be off, or it does not exist and this is a no-op. This cannot be told apart statically — check the deployed state.`
+            : kind === 'missing'
+              ? (missingSeverity === 'critical'
+                ? `"${s.display}" is created in a migration and its latest state does not enable Row Level Security. On Supabase the anon role has full table privileges by default, so with RLS off the public key can READ, INSERT, UPDATE and DELETE every row through the REST API. Static view only: this covers tables created by migrations in this repository — tables created from the dashboard or elsewhere are not listed here; the live probe enumerates all of them.`
+                : `"${s.display}" is created without Row Level Security. Only server code (pg/Prisma/…) appears to talk to this database, so nothing hands its rows to clients directly — that is normal, not a hole. It becomes CRITICAL the moment a client-facing data API (Supabase/PostgREST anon key, Hasura) is put in front of the same database.`)
+              : kind === 'order'
+                ? `"${s.display}" has statements in directories other than "${s.stateFile}" that contradict its final RLS state. Files in separate directories have no reliable apply order, so this cannot be decided statically — check the deployed state.`
+                : `"${s.display}" has a table or RLS statement whose execution cannot be confirmed statically: inside an IF/LOOP branch or a block with an EXCEPTION handler, after a RETURN, in a rolled-back or unterminated transaction, or on a name a TEMP table may shadow. Whether it took effect cannot be decided without running the migration, so its RLS state is NOT confirmed — check the deployed state.`,
         // The REVOKE-from-anon step only makes sense where an `anon` role is a
         // real thing to revoke from — the same condition `missingSeverity`
         // itself uses. Recommending it unconditionally told a server-only
         // Postgres user (no Supabase, no anon role) to revoke privileges from
         // a role that does not exist in their database, right next to a
-        // detail explaining that RLS is not needed there at all.
-        fix: exposed || !serverOnly
-          ? `ALTER TABLE ${s.display} ENABLE ROW LEVEL SECURITY; then add an owner/tenant policy, and drop any permissive "USING (true)" policy (policies are OR-ed). Until policies exist, stop the bleeding without breaking reads: REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${s.display} FROM anon; This is a static hint — confirm the deployed state.`
-          : `No action needed unless a client-facing data API (Supabase/PostgREST, Hasura) is ever put in front of this database — if it is, first ALTER TABLE ${s.display} ENABLE ROW LEVEL SECURITY and add an owner/tenant policy, then REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${s.display} FROM the role that API uses to connect.`,
+        // detail explaining that RLS is not needed there at all. An external
+        // table gets its own fix: we do not even know it exists, so neither
+        // the anon-revoke step nor the server-only "nothing to do" fits.
+        fix: kind === 'external'
+          ? `Confirm whether "${s.display}" exists in the deployed database. If it does, re-enable RLS: ALTER TABLE ${s.display} ENABLE ROW LEVEL SECURITY; and add an owner/tenant policy.`
+          : exposed || !serverOnly
+            ? `ALTER TABLE ${s.display} ENABLE ROW LEVEL SECURITY; then add an owner/tenant policy, and drop any permissive "USING (true)" policy (policies are OR-ed). Until policies exist, stop the bleeding without breaking reads: REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${s.display} FROM anon; This is a static hint — confirm the deployed state.`
+            : `No action needed unless a client-facing data API (Supabase/PostgREST, Hasura) is ever put in front of this database — if it is, first ALTER TABLE ${s.display} ENABLE ROW LEVEL SECURITY and add an owner/tenant policy, then REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON ${s.display} FROM the role that API uses to connect.`,
         checker: 'rls-migrations',
         level: 0,
-        file: s.file,
-        line: s.line,
-      });
-    }
-
-    // A DISABLE on a table this repo never shows being created is not "no
-    // information" — the instruction is right there, in the file being
-    // scanned. Either the table is real (created from the dashboard, or in a
-    // migration outside this repo) and RLS on it is now off, or it does not
-    // exist and this is a no-op; either way `!s.created` above silently
-    // dropped it, and it stayed dropped even when another table in the same
-    // project WAS found (satisfying the project-level "learned something"
-    // check elsewhere in this function). An ENABLE on an unmanaged table is
-    // the opposite, expected shape — someone correctly protecting a table
-    // this repo doesn't own — and is deliberately not flagged; only the LAST
-    // local instruction for the key matters, same as `state.enabled` already
-    // tracks for tables created here.
-    const lastToggleOnUnknown = new Map<string, Event>();
-    for (const e of events) {
-      if (e.kind === 'enable' || e.kind === 'disable') lastToggleOnUnknown.set(e.key, e); // apply order: last write wins
-    }
-    for (const [key, e] of lastToggleOnUnknown) {
-      if (isTempKey(key) || state.get(key)?.created || e.kind !== 'disable') continue;
-      findings.push({
-        id: 'rls_missing',
-        severity: 'warning',
-        title: `Table "${e.display}" has RLS disabled here, but is never created in this repo`,
-        detail: `"${e.display}" is not created by any migration this scan can see, but this file explicitly disables Row Level Security on it. Either the table is real — created from the dashboard, or in a migration outside this repo — and RLS on it is now off, or it does not exist and this is a no-op. This cannot be told apart statically — check the deployed state.`,
-        fix: `Confirm whether "${e.display}" exists in the deployed database. If it does, re-enable RLS: ALTER TABLE ${e.display} ENABLE ROW LEVEL SECURITY; and add an owner/tenant policy.`,
-        checker: 'rls-migrations',
-        level: 0,
-        file: e.file,
-        line: e.line,
+        file: external ? s.stateFile : s.file,
+        line: external ? s.stateLine : s.line,
       });
     }
 
@@ -806,7 +809,11 @@ export const rlsMigrationsChecker: Checker = {
     // below), so a migration that creates only a staging TEMP table — even
     // one that also DISABLEs RLS on a persistent table this repo never
     // defines — learned nothing about the real, permanent schema either.
-    const sawAnyTable = events.some((e) => e.kind === 'create' && !isTempKey(e.key));
+    // `findings.length > 0` also counts as "learned something": an external
+    // table (no local CREATE at all) can still produce a real finding — an
+    // explicit DISABLE sitting right in the scanned file — and that finding
+    // must not be thrown away just because no CREATE ever ran anywhere.
+    const sawAnyTable = findings.length > 0 || events.some((e) => e.kind === 'create' && !isTempKey(e.key));
     if (!sawAnyTable && notUnderstood.length === 0 && ctx.detection.backends.includes('supabase')) {
       return {
         findings: [...notApplicable, {

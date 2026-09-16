@@ -56,7 +56,13 @@ const RULES: Rule[] = [
     // inside one string literal — so prose mentioning "insert" won't match.
     // Quantifiers are length-bounded ({0,200}) to prevent catastrophic
     // backtracking (ReDoS) on very long / minified lines.
-    re: /`\s*(?:SELECT|INSERT|UPDATE|DELETE)\b[^`]{0,200}\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b[^`]{0,200}\$\{|f["']\s*(?:SELECT|INSERT|UPDATE|DELETE)\b[^"'\n]{0,200}\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b[^"'\n]{0,200}\{/gi,
+    //
+    // The f-string branch tracks its OWN opening quote via a backreference
+    // (`(?:(?!\1)[^\n])` — any char that isn't a newline or that quote) rather
+    // than excluding both quote characters outright: `f"SELECT … WHERE name =
+    // '{x}'"` nests a single-quoted SQL string value inside a double-quoted
+    // f-string, and excluding `'` too made the whole pattern never match.
+    re: /`\s*(?:SELECT|INSERT|UPDATE|DELETE)\b[^`]{0,200}\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b[^`]{0,200}\$\{|f(["'])\s*(?:SELECT|INSERT|UPDATE|DELETE)\b(?:(?!\1)[^\n]){0,200}\b(?:FROM|INTO|WHERE|VALUES|SET|JOIN)\b(?:(?!\1)[^\n]){0,200}\{/gi,
     severity: 'warning',
     detail: 'Interpolating values into SQL invites SQL injection.',
     fix: 'Use parameterized queries / prepared statements instead of string interpolation.',
@@ -94,7 +100,11 @@ function isParameterizedTemplate(scan: string, backtickAt: number): boolean {
  * from request data, so it is reported as info, not as an injection. About half
  * of the real-world hits were structural.
  */
-const VALUE_POSITION = /(=|<>|!=|<=|>=|<|>|\bLIKE|\bILIKE|\bIN\s*\(|\bVALUES\s*\([^)]*|\bBETWEEN|\bAND|\bOR|\bLIMIT|\bOFFSET|\bTHEN|\bELSE)\s*$/i;
+// A trailing `["']?` handles the equally common quoted-value shape
+// (`name = '${name}'`, `WHERE id = "${id}"`) — the SQL literal's own quote
+// sits directly before the hole, between the operator and `${`/`{`, and
+// without it that shape read as unquoted structure, not a value.
+const VALUE_POSITION = /(=|<>|!=|<=|>=|<|>|\bLIKE|\bILIKE|\bIN\s*\(|\bVALUES\s*\([^)]*|\bBETWEEN|\bAND|\bOR|\bLIMIT|\bOFFSET|\bTHEN|\bELSE)\s*["']?\s*$/i;
 const PLACEHOLDER_EXPR = /^\s*(?:\w+\.)?(placeholders?|params?|marks|questions|qs|values|binds?)\b/i;
 
 function onlyStructuralInterpolation(scan: string, at: number): boolean {
