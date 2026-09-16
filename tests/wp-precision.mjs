@@ -587,3 +587,72 @@ console.log('\nWP precision (re-check of the code-review fixes)');
   });
   rmSync(dir4, { recursive: true, force: true });
 }
+
+// A TEMP table's own CREATE does not count as "we learned the schema" — it is
+// session-only, excluded from findings for the same reason. A migration that
+// only touches a TEMP staging table (even one that also DISABLEs RLS on a
+// persistent table this repo never defines) must not silence the gap either.
+{
+  const dir = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'supabase/seed.sql': 'CREATE TEMP TABLE staging(id uuid);\n',
+  });
+  const r = await scanStatic(dir);
+  check('a TEMP-table-only migration still reports the coverage gap, not a clean pass', () => {
+    assert.ok(ids(r).includes('rls_unverifiable_no_migrations'), `got ${ids(r)}`);
+    assert.strictEqual(summarize(r.findings, r.runs).gate, 'incomplete');
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  const dir2 = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'supabase/seed.sql': 'CREATE TEMP TABLE staging(id uuid);\nALTER TABLE public.orders DISABLE ROW LEVEL SECURITY;\n',
+  });
+  const r2 = await scanStatic(dir2);
+  check('the same, plus a DISABLE on a table never defined locally, still reports the gap (not silence)', () => {
+    assert.ok(ids(r2).includes('rls_unverifiable_no_migrations'), `got ${ids(r2)}`);
+    assert.strictEqual(summarize(r2.findings, r2.runs).gate, 'incomplete');
+  });
+  rmSync(dir2, { recursive: true, force: true });
+
+  // Negative: a TEMP table alongside a REAL persistent one still finds the real one.
+  const dir3 = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'CREATE TEMP TABLE staging(id uuid);\nCREATE TABLE orders (id serial);\n',
+  });
+  const r3 = await scanStatic(dir3);
+  check('negative: a real permanent table alongside a TEMP one is still found and reported', () => {
+    assert.ok(ids(r3).includes('rls_missing'), `got ${ids(r3)}`);
+    assert.ok(!ids(r3).includes('rls_unverifiable_no_migrations'));
+  });
+  rmSync(dir3, { recursive: true, force: true });
+}
+
+// A Supabase project whose only local .sql is a foreign-engine file (SQLite,
+// MySQL) has learned nothing about its real Postgres schema either — that
+// engine's files being "not applicable" must not silence the separate,
+// still-true fact that Postgres schema info is missing for this project.
+{
+  const dir = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'local-cache.sql': 'CREATE TABLE cache(id INTEGER PRIMARY KEY AUTOINCREMENT);\n',
+  });
+  const r = await scanStatic(dir);
+  check('a Supabase project whose only .sql is a SQLite file reports BOTH the skip and the coverage gap', () => {
+    assert.ok(ids(r).includes('rls_not_applicable'), `got ${ids(r)}`);
+    assert.ok(ids(r).includes('rls_unverifiable_no_migrations'), `got ${ids(r)}`);
+    assert.strictEqual(summarize(r.findings, r.runs).gate, 'incomplete');
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  // Negative: a genuinely SQLite-only project (no Supabase anywhere) is
+  // unaffected — the skip note alone, gate stays pass, as before.
+  const dir2 = fixture({ 'local-cache.sql': 'CREATE TABLE cache(id INTEGER PRIMARY KEY AUTOINCREMENT);\n' });
+  const r2 = await scanStatic(dir2);
+  check('negative: a plain SQLite-only project (no Supabase) still just gets the skip note, gate pass', () => {
+    assert.ok(ids(r2).includes('rls_not_applicable'));
+    assert.ok(!ids(r2).includes('rls_unverifiable_no_migrations'), `got ${ids(r2)}`);
+    assert.strictEqual(summarize(r2.findings, r2.runs).gate, 'pass');
+  });
+  rmSync(dir2, { recursive: true, force: true });
+}

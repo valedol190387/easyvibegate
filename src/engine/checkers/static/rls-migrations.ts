@@ -619,12 +619,14 @@ export const rlsMigrationsChecker: Checker = {
       file: skipped[0]?.file ?? '',
       line: 1,
     }];
-    // Only a genuine "every SQL file here is a foreign engine" returns early —
-    // that IS settled (SQLite/MySQL truly have no RLS). Zero SQL files at all
-    // (`skipped.length === 0` too) is NOT settled the same way: it falls
-    // through to the checks below, which decide from what was actually parsed
-    // whether anything about this project's schema was learned at all.
-    if (analyzed.length === 0 && skipped.length > 0) return notApplicable;
+    // No early return here even when every SQL file present was a foreign
+    // engine (`analyzed.length === 0 && skipped.length > 0`): that settles
+    // those FILES (SQLite/MySQL truly have no RLS), but not the PROJECT — a
+    // Supabase project whose only local .sql happens to be a SQLite cache
+    // file has learned nothing about its real Postgres schema either. Both
+    // this case and zero SQL files at all fall through to the checks below,
+    // which decide from what was actually parsed (nothing, here) whether
+    // anything about the applicable backend's schema was learned.
 
     // "No RLS" is a hole only when untrusted clients reach the database directly
     // (Supabase/PostgREST with the anon key, Hasura). A Postgres that only server
@@ -766,7 +768,13 @@ export const rlsMigrationsChecker: Checker = {
     // the first two: presence of a .sql file is not presence of schema
     // information. `events` tells the two apart directly — a table that was
     // found and IS clean still produced a 'create' event, just no finding.
-    const sawAnyTable = events.some((e) => e.kind === 'create');
+    //
+    // A TEMP table's own 'create' does NOT count: it is session-only and
+    // PostgREST never sees it (the same reason it is excluded from findings
+    // below), so a migration that creates only a staging TEMP table — even
+    // one that also DISABLEs RLS on a persistent table this repo never
+    // defines — learned nothing about the real, permanent schema either.
+    const sawAnyTable = events.some((e) => e.kind === 'create' && !isTempKey(e.key));
     if (!sawAnyTable && notUnderstood.length === 0 && ctx.detection.backends.includes('supabase')) {
       return {
         findings: [...notApplicable, {
