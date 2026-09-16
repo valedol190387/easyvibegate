@@ -199,13 +199,14 @@ console.log('\nWP sql — F25/F26 engine + exposure');
   });
   rmSync(dir4, { recursive: true, force: true });
 
-  // F26: server-only Postgres → warning with server-only wording; Supabase → critical.
+  // F26: server-only Postgres → advisory (its own fix text says "no action
+  // needed" — a warning docking points would contradict that); Supabase → critical.
   const dir5 = fixture({ 'package.json': '{"name":"x","dependencies":{"pg":"^8"}}\n', 'db/1.sql': 'CREATE TABLE orders (id serial);\n' });
   const r5 = await scanStatic(dir5);
-  check('F26: no RLS on a server-only Postgres (pg, no client data API) is a warning, not critical', () => {
+  check('F26: no RLS on a server-only Postgres (pg, no client data API) is advisory, not critical', () => {
     const f = r5.findings.find((x) => x.id === 'rls_missing');
     assert.ok(f, `got ${ids(r5)}`);
-    assert.strictEqual(f.severity, 'warning');
+    assert.strictEqual(f.severity, 'advisory');
     assert.match(f.title, /server-only/i);
   });
   rmSync(dir5, { recursive: true, force: true });

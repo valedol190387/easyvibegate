@@ -534,3 +534,56 @@ console.log('\nWP precision (re-check of the code-review fixes)');
   });
   rmSync(dir2, { recursive: true, force: true });
 }
+
+// A .sql file existing is not the same as it defining a schema — a maintenance
+// query or a seed script with no CREATE TABLE must not silence the "could not
+// verify RLS" signal any more than having zero .sql files does.
+{
+  const dir = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'maintenance.sql': 'SELECT now();\n',
+  });
+  const r = await scanStatic(dir);
+  const s = summarize(r.findings, r.runs);
+  check('a .sql file with no CREATE TABLE (a maintenance query) still reports the coverage gap', () => {
+    assert.ok(ids(r).includes('rls_unverifiable_no_migrations'), `got ${ids(r)}`);
+    assert.strictEqual(s.gate, 'incomplete');
+    assert.strictEqual(exitCodeFor(s), 3);
+  });
+  rmSync(dir, { recursive: true, force: true });
+
+  const dir2 = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'supabase/seed.sql': 'INSERT INTO public.orders(id) VALUES (1);\n',
+  });
+  const r2 = await scanStatic(dir2);
+  check('a seed.sql with no CREATE TABLE (schema made from the dashboard) also reports the gap', () => {
+    assert.ok(ids(r2).includes('rls_unverifiable_no_migrations'), `got ${ids(r2)}`);
+    assert.strictEqual(summarize(r2.findings, r2.runs).gate, 'incomplete');
+  });
+  rmSync(dir2, { recursive: true, force: true });
+
+  // Negative: a real CREATE TABLE with RLS enabled is genuinely clean — no gap reported.
+  const dir3 = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'CREATE TABLE orders (id serial);\nALTER TABLE orders ENABLE ROW LEVEL SECURITY;\n',
+  });
+  const r3 = await scanStatic(dir3);
+  check('negative: a real, RLS-enabled table is a genuine clean result, not an unverifiable gap', () => {
+    assert.ok(!ids(r3).includes('rls_unverifiable_no_migrations'), `got ${ids(r3)}`);
+    assert.strictEqual(summarize(r3.findings, r3.runs).gate, 'pass');
+  });
+  rmSync(dir3, { recursive: true, force: true });
+
+  // Negative: a real CREATE TABLE missing RLS still reports the REAL finding, not the gap.
+  const dir4 = fixture({
+    'package.json': '{"name":"x","dependencies":{"@supabase/supabase-js":"^2"}}\n',
+    'db/1.sql': 'CREATE TABLE orders (id serial);\n',
+  });
+  const r4 = await scanStatic(dir4);
+  check('negative: a real table missing RLS reports rls_missing, not the coverage-gap finding', () => {
+    assert.ok(ids(r4).includes('rls_missing'));
+    assert.ok(!ids(r4).includes('rls_unverifiable_no_migrations'), `got ${ids(r4)}`);
+  });
+  rmSync(dir4, { recursive: true, force: true });
+}

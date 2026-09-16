@@ -552,40 +552,6 @@ export const rlsMigrationsChecker: Checker = {
   level: 0,
   run(ctx) {
     const sqlFiles = ctx.files.filter((f) => f.ext === '.sql').sort((a, b) => a.rel.localeCompare(b.rel));
-    if (sqlFiles.length === 0) {
-      // A project that clearly talks to Supabase but ships no .sql migrations
-      // (schema managed from the dashboard, or migrations live in another repo)
-      // used to just say nothing — a silent, undeserved clean score on the exact
-      // check the tool exists for. Say what could not be checked instead.
-      // The SAME signal `exposed`/`pgProject` use below, not a separate, looser
-      // one: a bespoke regex here (bare `SUPABASE_ANON_KEY`/`postgrest`/etc.
-      // anywhere in any file) matched this very file, which mentions those
-      // strings as the patterns it detects them WITH — a security scanner
-      // that flags itself as a Supabase project is exactly the kind of
-      // self-referential false positive dogfooding exists to catch. A real
-      // Supabase project's client library dependency is enough to detect it;
-      // `ctx.detection.backends` already carries that, hardened project-wide.
-      if (!ctx.detection.backends.includes('supabase')) return [];
-      // This is the exact "unknown ≠ clean" case the tool exists to catch: the
-      // check APPLIES (unlike the SQLite/D1 skip below, which is genuinely not
-      // applicable and rightly leaves the gate alone) but could not run. An
-      // info-only finding left the gate at `pass` and coverage.incomplete at
-      // `false` — a minimal Supabase project with zero SQL scored 98/100 PASS,
-      // exit 0, with RLS on every real table entirely unverified. `partial`
-      // makes the run status reflect that: gate incomplete, exit 3.
-      return {
-        findings: [{
-          id: 'rls_unverifiable_no_migrations',
-          severity: 'info',
-          title: 'No SQL migrations found — RLS could not be checked statically',
-          detail: 'This project talks to Supabase, but no .sql migration files exist in this repository (the schema may be managed from the dashboard, or migrations live in a different repo). A static scan can only see table/RLS state from files it can read, so no table here could be verified this way — this is missing information, not a clean result.',
-          fix: 'Run the live probe (consent + --i-own-this) to enumerate which tables the anon key can read, or check pg_class.relrowsecurity and pg_policies directly in the Supabase SQL editor.',
-          checker: 'rls-migrations',
-          level: 0,
-        }],
-        partial: 'no SQL migrations found for a Supabase project — RLS could not be checked for any table',
-      };
-    }
 
     // RLS is a PostgreSQL feature. The engine is decided per FILE, not per
     // project: a monorepo can hold a Postgres schema next to a Cloudflare D1
@@ -653,7 +619,12 @@ export const rlsMigrationsChecker: Checker = {
       file: skipped[0]?.file ?? '',
       line: 1,
     }];
-    if (analyzed.length === 0) return notApplicable;
+    // Only a genuine "every SQL file here is a foreign engine" returns early —
+    // that IS settled (SQLite/MySQL truly have no RLS). Zero SQL files at all
+    // (`skipped.length === 0` too) is NOT settled the same way: it falls
+    // through to the checks below, which decide from what was actually parsed
+    // whether anything about this project's schema was learned at all.
+    if (analyzed.length === 0 && skipped.length > 0) return notApplicable;
 
     // "No RLS" is a hole only when untrusted clients reach the database directly
     // (Supabase/PostgREST with the anon key, Hasura). A Postgres that only server
@@ -668,7 +639,10 @@ export const rlsMigrationsChecker: Checker = {
       !exposed &&
       (/"(pg|postgres|pg-promise|@prisma\/client|drizzle-orm|knex|kysely|typeorm|sequelize)"/i.test(pkg) ||
         /\b(psycopg2?|asyncpg|sqlalchemy)\b/i.test(reqs));
-    const missingSeverity = exposed || !serverOnly ? 'critical' as const : 'warning' as const;
+    // Server-only is 'advisory', not 'warning': the fix text for this exact
+    // case says "no action needed unless X" — a warning (−8 points, shown as
+    // a problem to look into) contradicted its own explanation of itself.
+    const missingSeverity = exposed || !serverOnly ? 'critical' as const : 'advisory' as const;
 
     const events: Event[] = [];
     const notUnderstood: string[] = [];
@@ -783,6 +757,29 @@ export const rlsMigrationsChecker: Checker = {
         file: s.file,
         line: s.line,
       });
+    }
+    // Zero findings can mean two very different things: every table here has
+    // RLS handled correctly, or no table definition was ever found in the SQL
+    // at all — a maintenance script (`SELECT now();`), a seed file with no
+    // CREATE TABLE (schema itself made from the dashboard), or literally zero
+    // .sql files. `sqlFiles.length === 0` alone used to gate this and missed
+    // the first two: presence of a .sql file is not presence of schema
+    // information. `events` tells the two apart directly — a table that was
+    // found and IS clean still produced a 'create' event, just no finding.
+    const sawAnyTable = events.some((e) => e.kind === 'create');
+    if (!sawAnyTable && notUnderstood.length === 0 && ctx.detection.backends.includes('supabase')) {
+      return {
+        findings: [...notApplicable, {
+          id: 'rls_unverifiable_no_migrations',
+          severity: 'info',
+          title: 'No table definitions found in SQL — RLS could not be checked statically',
+          detail: 'This project talks to Supabase, but no CREATE TABLE (or SELECT ... INTO) was found in any .sql file here — either there are no migrations, or the ones present (a seed script, a maintenance query) do not define a schema. The schema may be managed from the dashboard, or migrations may live in a different repo. A static scan can only see table/RLS state from files it can read, so no table here could be verified this way — this is missing information, not a clean result.',
+          fix: 'Run the live probe (consent + --i-own-this) to enumerate which tables the anon key can read, or check pg_class.relrowsecurity and pg_policies directly in the Supabase SQL editor.',
+          checker: 'rls-migrations',
+          level: 0,
+        }],
+        partial: 'no table definitions found in SQL for a Supabase project — RLS could not be checked for any table',
+      };
     }
     const all = [...findings, ...notApplicable];
     if (notUnderstood.length === 0) return all;
